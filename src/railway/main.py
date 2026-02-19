@@ -184,6 +184,9 @@ def run_model_retraining():
     except Exception as e:
         logger.error(f"❌ Model retraining failed: {e}")
         return False
+
+
+def load_models():
     """Load ML models from disk"""
     global model_rf, le_location, le_ptype, market_data, last_update_time
     
