@@ -19,12 +19,12 @@ COPY . .
 # Create data directories for persistent storage
 RUN mkdir -p /data/raw /data/models /data/logs
 
-# Expose port
+# Expose port (Railway injects $PORT at runtime)
 EXPOSE 8000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
 
 # Run the FastAPI server
 CMD ["python", "src/railway/main.py"]
