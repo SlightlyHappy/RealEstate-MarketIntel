@@ -15,6 +15,12 @@ from pathlib import Path
 from datetime import datetime
 import os
 import logging
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, r2_score
+import warnings
+warnings.filterwarnings('ignore')
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -60,7 +66,124 @@ last_update_time = None
 # MODEL LOADING
 # ============================================================================
 
-def load_models():
+def normalize_prices(df):
+    """Normalize all prices to Crores"""
+    def to_crore(row):
+        price = float(row['price'])
+        if row['price_unit'] == 'Lac':
+            return price / 100
+        return price
+    df['price_cr'] = df.apply(to_crore, axis=1)
+    return df
+
+
+def clean_data(df):
+    """Remove anomalies and prepare for modeling"""
+    logger.info(f"Original records: {len(df)}")
+    
+    # Convert dtypes
+    df['bhk'] = pd.to_numeric(df['bhk'], errors='coerce')
+    df['area_sqft'] = pd.to_numeric(df['area_sqft'], errors='coerce')
+    
+    # Remove invalid
+    df = df[(df['bhk'] >= 1) & (df['bhk'] <= 5)].copy()
+    df = df[(df['area_sqft'] >= 300) & (df['area_sqft'] <= 10000)].copy()
+    df = df[(df['price_cr'] >= 0.3) & (df['price_cr'] <= 50)].copy()
+    df = df.dropna(subset=['bhk', 'area_sqft', 'price_cr', 'location'])
+    
+    logger.info(f"After cleaning: {len(df)}")
+    return df
+
+
+def feature_engineering(df):
+    """Create features for modeling"""
+    df['price_per_sqft'] = (df['price_cr'] * 10_000_000) / df['area_sqft']
+    
+    # Location grouping
+    location_counts = df['location'].value_counts()
+    major_locations = location_counts[location_counts >= 20].index.tolist()
+    df['location_grouped'] = df['location'].apply(
+        lambda x: x if x in major_locations else 'Other'
+    )
+    
+    # Encode categorical variables
+    le_location = LabelEncoder()
+    le_ptype = LabelEncoder()
+    
+    df['location_encoded'] = le_location.fit_transform(df['location_grouped'])
+    df['ptype_encoded'] = le_ptype.fit_transform(df['property_type'])
+    
+    return df, le_location, le_ptype
+
+
+def run_model_retraining():
+    """Full retraining pipeline - called weekly or manually"""
+    global model_rf, le_location, le_ptype, market_data, last_update_time
+    
+    logger.info("🔄 Starting model retraining...")
+    
+    try:
+        # Load and prepare data
+        data_path = DATA_DIR / "magicbricks_all_cities.jsonl"
+        records = []
+        with open(data_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    records.append(json.loads(line))
+        
+        df = pd.DataFrame(records)
+        logger.info(f"Loaded {len(df)} total properties")
+        
+        # Clean data
+        df = normalize_prices(df)
+        df = clean_data(df)
+        
+        # Feature engineering
+        df, le_location, le_ptype = feature_engineering(df)
+        
+        logger.info(f"Training on {len(df)} cleaned properties, {df['location_grouped'].nunique()} locations")
+        
+        # Prepare training data
+        feature_cols = ['bhk', 'area_sqft', 'location_encoded', 'ptype_encoded', 'price_per_sqft']
+        X = df[feature_cols].values
+        y = df['price_cr'].values
+        
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
+        
+        # Train Random Forest
+        logger.info("Training Random Forest...")
+        model_rf = RandomForestRegressor(n_estimators=100, max_depth=20, random_state=42, n_jobs=-1)
+        model_rf.fit(X_train, y_train)
+        
+        # Evaluate
+        y_pred = model_rf.predict(X_test)
+        mae = mean_absolute_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+        
+        logger.info(f"Model Performance - MAE: {mae:.4f} Cr, R²: {r2:.4f}")
+        
+        # Save models
+        model_path = MODEL_DIR / "price_predictor_rf.pkl"
+        encoder_path = MODEL_DIR / "encoders.pkl"
+        
+        with open(model_path, 'wb') as f:
+            pickle.dump(model_rf, f)
+        with open(encoder_path, 'wb') as f:
+            pickle.dump((le_location, le_ptype), f)
+        
+        logger.info(f"✅ Models saved to {MODEL_DIR}")
+        
+        # Update global state
+        market_data = df
+        last_update_time = datetime.utcnow()
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Model retraining failed: {e}")
+        return False
     """Load ML models from disk"""
     global model_rf, le_location, le_ptype, market_data, last_update_time
     
@@ -386,32 +509,30 @@ def trigger_scraper_manual(x_api_key: str = Header(None)):
 
 
 @app.post("/admin/retrain-model", tags=["Admin"])
-def retrain_model(x_api_key: str = Header(None)):
+def retrain_model_endpoint(x_api_key: str = Header(None)):
     """
     Manually retrain ML model (Admin only)
+    Header: X-API-Key: <ADMIN_API_KEY>
     """
     if x_api_key != ADMIN_KEY:
-        raise HTTPException(status_code=403, detail="Invalid API key")
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
     
     try:
         logger.info("🧠 Manual model retraining started")
         
-        # Import training pipeline
-        import sys
-        sys.path.insert(0, "/app/notebooks")
-        # This would import and run the training pipeline
-        # For now, just reload existing models
+        # Run full retraining pipeline
+        if run_model_retraining():
+            logger.info("✅ Model retraining completed")
+            return {
+                "status": "Success",
+                "message": "Model retraining completed and models reloaded",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Model retraining failed - check logs")
         
-        load_models()
-        
-        logger.info("✅ Model retraining completed")
-        
-        return {
-            "status": "Success",
-            "message": "Model retraining completed and loaded",
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Retrain error: {e}")
         raise HTTPException(status_code=500, detail=f"Retraining failed: {str(e)}")
@@ -438,9 +559,10 @@ def scheduled_weekly_update():
         
         # Step 2: Retrain model
         logger.info("Step 2/3: Retraining ML model...")
-        sys.path.insert(0, "/app/notebooks")
-        # Would run training here
-        logger.info("✅ Model retraining completed")
+        if run_model_retraining():
+            logger.info("✅ Model retraining completed")
+        else:
+            logger.error("❌ Model retraining failed - using existing models")
         
         # Step 3: Reload models
         logger.info("Step 3/3: Reloading models into memory...")
