@@ -246,9 +246,20 @@ def load_models():
         market_data['area_sqft'] = pd.to_numeric(market_data['area_sqft'], errors='coerce')
         market_data['price_per_sqft'] = (market_data['price_cr'] * 10_000_000) / market_data['area_sqft']
         
+        # Group rare/unseen locations to 'Other' (same logic as during training)
+        known_locations = set(le_location.classes_)
+        market_data['location_grouped'] = market_data['location'].apply(
+            lambda x: x if x in known_locations else 'Other'
+        )
+        # Map unseen property types to the most common known type
+        known_ptypes = set(le_ptype.classes_)
+        market_data['ptype_grouped'] = market_data['property_type'].apply(
+            lambda x: x if x in known_ptypes else le_ptype.classes_[0]
+        )
+
         # Encode locations
-        market_data['location_encoded'] = le_location.transform(market_data['location'])
-        market_data['ptype_encoded'] = le_ptype.transform(market_data['property_type'])
+        market_data['location_encoded'] = le_location.transform(market_data['location_grouped'])
+        market_data['ptype_encoded'] = le_ptype.transform(market_data['ptype_grouped'])
         
         last_update_time = datetime.fromtimestamp(data_path.stat().st_mtime)
         
