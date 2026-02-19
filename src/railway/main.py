@@ -529,10 +529,22 @@ def trigger_scraper_manual(x_api_key: str = Header(None)):
         from magicbricks_scraper import scrape_infinite_parallel
         
         # Run scraper (with data persisted to /data/raw)
-        scrape_infinite_parallel(max_pages=15, enable_details=True, max_workers=2)
+        logger.info("🔍 Starting scraper...")
+        try:
+            scrape_infinite_parallel(max_pages=15, enable_details=True, max_workers=2)
+            logger.info("✅ Scraper completed successfully")
+        except Exception as scraper_err:
+            logger.error(f"❌ Scraper failed: {scraper_err}", exc_info=True)
+            raise
         
         # Reload models
-        load_models()
+        logger.info("🔄 Reloading models...")
+        try:
+            load_models()
+            logger.info("✅ Models reloaded successfully")
+        except Exception as load_err:
+            logger.error(f"❌ Model loading failed: {load_err}", exc_info=True)
+            raise
         
         logger.info("✅ Manual scraper completed")
         
@@ -543,7 +555,7 @@ def trigger_scraper_manual(x_api_key: str = Header(None)):
         }
         
     except Exception as e:
-        logger.error(f"Scraper error: {e}")
+        logger.error(f"Scraper error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Scraper failed: {str(e)}")
 
 
