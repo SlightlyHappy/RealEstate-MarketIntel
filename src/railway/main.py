@@ -243,7 +243,15 @@ def load_models():
             return price / 100 if row['price_unit'] == 'Lac' else price
         
         market_data['price_cr'] = market_data.apply(to_crore, axis=1)
+        market_data['bhk'] = pd.to_numeric(market_data['bhk'], errors='coerce')
         market_data['area_sqft'] = pd.to_numeric(market_data['area_sqft'], errors='coerce')
+
+        # Apply the same cleaning filters used during training
+        market_data = market_data[(market_data['bhk'] >= 1) & (market_data['bhk'] <= 5)].copy()
+        market_data = market_data[(market_data['area_sqft'] >= 300) & (market_data['area_sqft'] <= 10000)].copy()
+        market_data = market_data[(market_data['price_cr'] >= 0.3) & (market_data['price_cr'] <= 50)].copy()
+        market_data = market_data.dropna(subset=['bhk', 'area_sqft', 'price_cr', 'location'])
+
         market_data['price_per_sqft'] = (market_data['price_cr'] * 10_000_000) / market_data['area_sqft']
         
         # Group rare/unseen locations to 'Other' (same logic as during training)
@@ -402,8 +410,8 @@ def market_heatmap():
         raise HTTPException(status_code=503, detail="Models loading")
     
     heatmap = []
-    for location in sorted(market_data['location'].unique()):
-        loc_data = market_data[market_data['location'] == location]
+    for location in sorted(market_data['location_grouped'].unique()):
+        loc_data = market_data[market_data['location_grouped'] == location]
         
         # Determine market heat
         if len(loc_data) > 100:
@@ -456,8 +464,8 @@ def deals_this_week(min_discount: int = 15):
             market_data_copy['predicted_price'] * 100
         )
         
-        # Find best deals (underpriced by min_discount%)
-        deals = market_data_copy[market_data_copy['discount_pct'] > min_discount].nlargest(20, 'area_sqft')
+        # Find best deals (underpriced: listed price is BELOW fair value by min_discount%)
+        deals = market_data_copy[market_data_copy['discount_pct'] < -min_discount].nlargest(20, 'area_sqft')
         
         deal_list = []
         for _, row in deals.iterrows():
@@ -468,8 +476,8 @@ def deals_this_week(min_discount: int = 15):
                     "area_sqft": int(row['area_sqft']),
                     "listed_price_cr": round(row['price_cr'], 2),
                     "fair_value_cr": round(row['predicted_price'], 2),
-                    "savings_cr": round(row['price_cr'] - row['predicted_price'], 2),
-                    "discount_pct": round(row['discount_pct'], 1),
+                    "savings_cr": round(row['predicted_price'] - row['price_cr'], 2),
+                    "discount_pct": round(abs(row['discount_pct']), 1),
                     "property_type": row['property_type']
                 })
             except:
