@@ -320,7 +320,7 @@ class MagicBricksInfiniteScraper:
             logger.error(f"Error saving to CSV: {str(e)}")
 
 
-def scrape_single_city_task(city: str, max_pages: int = 15, enable_details: bool = True, output_dir: str = None) -> Dict[str, int]:
+def scrape_single_city_task(city: str, max_pages: int = 50, enable_details: bool = True, output_dir: str = None) -> Dict[str, int]:
     """Helper function to scrape a single city. Used for parallel processing."""
     
     try:
@@ -383,7 +383,7 @@ def scrape_single_city_task(city: str, max_pages: int = 15, enable_details: bool
         return {"city": city, "total": 0}
 
 
-def scrape_infinite_parallel(max_pages: int = 15, enable_details: bool = True, max_workers: int = 3):
+def scrape_infinite_parallel(max_pages: int = 50, enable_details: bool = True, max_workers: int = 3):
     """Scrape properties in parallel across multiple cities"""
     
     script_dir = Path(__file__).parent
@@ -618,10 +618,10 @@ def scrape_infinite(max_pages: int = 5, enable_details: bool = True):
 
 
 if __name__ == "__main__":
-    # Scrape 15 pages per city with detail enrichment
-    # This will fetch ~400-450 properties per city across all 10 major Indian cities
-    # Total expected: 4000-5000 properties
+    # Scrape 50 pages per city with detail enrichment
+    # This will fetch ~1,000-1,250 properties per city across all 10 major Indian cities
+    # Total expected: 10,000-12,500 properties
     #
     # Now using PARALLEL scraper (3 cities at a time for performance + safety)
     # Use max_workers=2 for lighter load, max_workers=4 for more aggressive speed
-    scrape_infinite_parallel(max_pages=15, enable_details=True, max_workers=3)
+    scrape_infinite_parallel(max_pages=50, enable_details=True, max_workers=3)
