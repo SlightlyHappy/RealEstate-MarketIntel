@@ -11,6 +11,7 @@ import pickle
 import pandas as pd
 import numpy as np
 import json
+import shutil
 from pathlib import Path
 from datetime import datetime
 import os
@@ -186,6 +187,37 @@ def run_model_retraining():
         return False
 
 
+def initialize_persistent_volume():
+    """On first run, copy models and data from repo to persistent volume"""
+    
+    # Check if models exist in persistent volume
+    models_exist = (MODEL_DIR / "price_predictor_rf.pkl").exists()
+    data_exists = (DATA_DIR / "magicbricks_all_cities.jsonl").exists()
+    
+    if not models_exist or not data_exists:
+        logger.info("📁 Initializing persistent volume from repository...")
+        
+        # Copy from repo to persistent volume
+        repo_models = Path("/app/models")
+        repo_data = Path("/app/data/raw")
+        
+        try:
+            if repo_models.exists() and not models_exist:
+                logger.info(f"  Copying models from {repo_models} to {MODEL_DIR}...")
+                for pkl_file in repo_models.glob("*.pkl"):
+                    shutil.copy2(pkl_file, MODEL_DIR / pkl_file.name)
+                logger.info(f"  ✅ Models copied")
+            
+            if repo_data.exists() and not data_exists:
+                logger.info(f"  Copying data from {repo_data} to {DATA_DIR}...")
+                for data_file in repo_data.glob("*"):
+                    shutil.copy2(data_file, DATA_DIR / data_file.name)
+                logger.info(f"  ✅ Data copied")
+                
+        except Exception as e:
+            logger.warning(f"  ⚠️ Could not copy files: {e}")
+
+
 def load_models():
     """Load ML models from disk"""
     global model_rf, le_location, le_ptype, market_data, last_update_time
@@ -234,6 +266,10 @@ def load_models():
 # Load models on startup
 @app.on_event("startup")
 async def startup():
+    # First, initialize persistent volume from repo if needed
+    initialize_persistent_volume()
+    
+    # Then load models
     if not load_models():
         logger.warning("Models not loaded - API will return errors until models are available")
 
