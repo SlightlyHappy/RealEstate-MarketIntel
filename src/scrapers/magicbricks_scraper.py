@@ -1,120 +1,124 @@
 """
-Magic Bricks Scraper - Infinite Scroll Version with Parallel Processing
-Continuously fetches properties by simulating pagination/infinite scroll
-Runs multiple cities in parallel with IP rotation and user agent rotation
+MagicBricks Scraper — Anti-403 Edition
+=======================================
+Layers of defence against bot detection:
+
+1. TLS/JA3/HTTP2 fingerprinting via curl_cffi — latest Chrome versions
+   (the #1 signal Cloudflare uses, missed by plain requests/httpx)
+2. Per-chrome-version Sec-CH-UA headers that exactly match the TLS fingerprint
+3. Google referrer chain — simulates arriving from a Google search result
+4. Residential proxy support — eliminates datacenter-IP detection
+   (set PROXY_URL env var, e.g. http://user:pass@gate.smartproxy.com:7000)
+5. City-level fresh sessions — new browser identity per city
+6. Gaussian inter-request delays — human-like timing distribution
+7. Soft-block detection — catches 200 responses that are actually CAPTCHA pages
+8. Exponential back-off with fingerprint rotation on hard 403s
 """
 
 import json
 import csv
 import logging
-from datetime import datetime
-from typing import List, Dict, Optional, Set
-from pathlib import Path
-import re
-from bs4 import BeautifulSoup
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import time
+import os
 import random
-from threading import Lock
+import re
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from threading import Lock
+from typing import Dict, List, Optional
 
-# Setup logging
+from bs4 import BeautifulSoup
+
+try:
+    from curl_cffi import requests as cffi_requests
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    import requests as cffi_requests          # fallback — expect more 403s
+    CURL_CFFI_AVAILABLE = False
+
+# Proxy URL — set in Railway env vars as PROXY_URL
+# Format: http://user:pass@host:port  or  socks5://user:pass@host:port
+# Leave unset to scrape without a proxy (datacenter IP, higher 403 rate)
+PROXY_URL: Optional[str] = os.getenv("PROXY_URL")
+
+# ─────────────────────────── logging ────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
-# Suppress unicode issues on Windows
-import sys
-if sys.stdout.encoding != 'utf-8':
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-# Up-to-date user agents (Chrome 124/125, Firefox 125, Edge 124, Safari 17)
-USER_AGENTS = [
-    # Chrome on Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    # Chrome on macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    # Chrome on Linux
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    # Firefox
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:126.0) Gecko/20100101 Firefox/126.0",
-    # Edge
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-    # Safari on macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
-    # Chrome on Android
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+# ─────────────────────── Chrome profiles ────────────────────────────────────
+# Each entry bundles: curl_cffi impersonate target + matching Sec-CH-UA headers.
+# Older entries (chrome120) kept as last-resort fallbacks.
+CHROME_PROFILES = [
+    {
+        "impersonate": "chrome136",
+        "sec_ch_ua": '"Google Chrome";v="136", "Chromium";v="136", "Not_A Brand";v="24"',
+        "sec_ch_ua_mobile": "?0",
+        "sec_ch_ua_platform": '"Windows"',
+    },
+    {
+        "impersonate": "chrome133a",
+        "sec_ch_ua": '"Google Chrome";v="133", "Chromium";v="133", "Not_A Brand";v="24"',
+        "sec_ch_ua_mobile": "?0",
+        "sec_ch_ua_platform": '"Windows"',
+    },
+    {
+        "impersonate": "chrome131",
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec_ch_ua_mobile": "?0",
+        "sec_ch_ua_platform": '"Windows"',
+    },
+    {
+        "impersonate": "chrome124",
+        "sec_ch_ua": '"Google Chrome";v="124", "Chromium";v="124", "Not_A Brand";v="99"',
+        "sec_ch_ua_mobile": "?0",
+        "sec_ch_ua_platform": '"Windows"',
+    },
+    {
+        "impersonate": "chrome120",
+        "sec_ch_ua": '"Google Chrome";v="120", "Chromium";v="120", "Not_A Brand";v="99"',
+        "sec_ch_ua_mobile": "?0",
+        "sec_ch_ua_platform": '"Windows"',
+    },
 ]
 
-# Matching Sec-CH-UA headers per user-agent (Chrome/Edge only — Firefox and Safari omit these)
-SEC_CH_UA_MAP = {
-    "Chrome/125": '"Google Chrome";v="125", "Chromium";v="125", "Not-A.Brand";v="99"',
-    "Chrome/124": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
-    "Edg/124":   '"Microsoft Edge";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
-}
+ACCEPT_LANGUAGES = [
+    "en-IN,en-GB;q=0.9,en;q=0.8,hi;q=0.5",
+    "en-US,en;q=0.9,hi;q=0.7,en-IN;q=0.6",
+    "en-GB,en;q=0.9,en-US;q=0.8",
+]
+
+# Minimum HTML size (bytes) for a valid listing page
+MIN_LISTING_PAGE_SIZE = 50_000
+
+# Keywords that indicate a soft-block / CAPTCHA even on status 200
+SOFT_BLOCK_KEYWORDS = [
+    "access denied",
+    "verify you are human",
+    "captcha",
+    "cloudflare",
+    "enable javascript",
+    "checking your browser",
+    "just a moment",
+    "ddos-guard",
+]
 
 
-def _get_headers_for_ua(ua: str, referer: str) -> Dict:
-    """Build a realistic, browser-matched header set for the given User-Agent."""
-    is_mobile = "Mobile" in ua or "Android" in ua
-    is_firefox = "Firefox" in ua
-    is_safari_only = "Safari" in ua and "Chrome" not in ua and "Edg" not in ua
-
-    headers: Dict = {
-        "User-Agent": ua,
-        "Accept-Language": random.choice([
-            "en-IN,en-GB;q=0.9,en;q=0.8",
-            "en-US,en;q=0.9,hi;q=0.7",
-            "en-GB,en;q=0.8",
-        ]),
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
-        "Referer": referer,
-    }
-
-    if is_firefox:
-        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-        headers["DNT"] = "1"
-        headers["Sec-Fetch-Dest"] = "document"
-        headers["Sec-Fetch-Mode"] = "navigate"
-        headers["Sec-Fetch-Site"] = "same-origin"
-        headers["Sec-Fetch-User"] = "?1"
-    elif is_safari_only:
-        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    else:
-        # Chrome / Edge / Chromium Android
-        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
-        headers["Sec-Fetch-Dest"] = "document"
-        headers["Sec-Fetch-Mode"] = "navigate"
-        headers["Sec-Fetch-Site"] = "same-origin"
-        headers["Sec-Fetch-User"] = "?1"
-        headers["sec-ch-ua-mobile"] = "?1" if is_mobile else "?0"
-        headers["sec-ch-ua-platform"] = '"Android"' if is_mobile else random.choice(['"Windows"', '"macOS"', '"Linux"'])
-        # Match Sec-CH-UA to actual version
-        for key, val in SEC_CH_UA_MAP.items():
-            if key in ua:
-                headers["sec-ch-ua"] = val
-                break
-
-    return headers
-
-
+# \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 scraper class \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 class MagicBricksInfiniteScraper:
-    """Scraper for extracting property data with infinite scroll support"""
-    
+    """Scrapes MagicBricks property listings with robust bot-detection evasion."""
+
     BASE_URL = "https://www.magicbricks.com/property-for-sale/residential-real-estate"
-    
-    # Major Indian cities to scrape
+
     CITIES = [
         "Delhi-NCR",
         "Bangalore",
@@ -125,642 +129,479 @@ class MagicBricksInfiniteScraper:
         "Kolkata",
         "Ahmedabad",
         "Jaipur",
-        "Indore"
+        "Indore",
     ]
-    
+
     BASE_FILTERS = {
         "bedroom": "2,3",
-        "proptype": "Multistorey-Apartment,Builder-Floor-Apartment,Penthouse,Studio-Apartment,Residential-House,Villa"
+        "proptype": (
+            "Multistorey-Apartment,Builder-Floor-Apartment,"
+            "Penthouse,Studio-Apartment,Residential-House,Villa"
+        ),
     }
-    
+
     def __init__(self, output_dir: str = "data/raw"):
-        """Initialize scraper"""
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.properties = []
-        self.seen_urls = set()
-        self.file_lock = Lock()  # Thread-safe file writing
+        self.seen_urls: set = set()
+        self.file_lock = Lock()
+        self.current_city: str = ""
+        self.filters: dict = {}
+
+        # Random Chrome profile for this instance
+        self._profile = random.choice(CHROME_PROFILES)
         self.session = self._make_session()
         self._warmed_up = False
 
-    def _make_session(self) -> requests.Session:
-        """Create a persistent session with connection pooling and automatic retries on network errors."""
-        session = requests.Session()
-        # Retry on transient network failures only — NOT on 403/4xx (handled manually)
-        retry = Retry(
-            total=2,
-            backoff_factor=1.5,
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["GET"],
-        )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
+        if CURL_CFFI_AVAILABLE:
+            logger.info(
+                f"[Session] curl_cffi ready \u2014 impersonating {self._profile['impersonate']}"
+                + (f" via proxy" if PROXY_URL else " (no proxy \u2014 datacenter IP)")
+            )
+        else:
+            logger.warning("[Session] curl_cffi not available \u2014 higher 403 rate expected")
+
+    # \u2500\u2500 session \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+    def _make_session(self):
+        """Create a new curl_cffi session with proxy if configured."""
+        if CURL_CFFI_AVAILABLE:
+            session = cffi_requests.Session(impersonate=self._profile["impersonate"])
+        else:
+            session = cffi_requests.Session()
+        if PROXY_URL:
+            session.proxies = {"https": PROXY_URL, "http": PROXY_URL}
         return session
 
-    def _warm_up(self):
-        """Hit the homepage first so we get cookies and look like a real visitor."""
+    def _rotate_profile(self):
+        """Switch to a different Chrome profile and open a fresh session."""
+        remaining = [p for p in CHROME_PROFILES if p["impersonate"] != self._profile["impersonate"]]
+        self._profile = random.choice(remaining) if remaining else random.choice(CHROME_PROFILES)
+        logger.info(f"[Session] Rotating fingerprint \u2192 {self._profile['impersonate']}")
+        self.session = self._make_session()
+        self._warmed_up = False
+
+    def _build_headers(self, referer: str) -> dict:
+        """Build a complete, fingerprint-consistent header set."""
+        return {
+            "Accept-Language": random.choice(ACCEPT_LANGUAGES),
+            "Referer": referer,
+            "Cache-Control": "max-age=0",
+            "Sec-CH-UA": self._profile["sec_ch_ua"],
+            "Sec-CH-UA-Mobile": self._profile["sec_ch_ua_mobile"],
+            "Sec-CH-UA-Platform": self._profile["sec_ch_ua_platform"],
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+    def _warm_up(self, city: str = ""):
+        """
+        3-hop warm-up simulating arrival from a Google search result:
+          Google search \u2192 MagicBricks homepage \u2192 city listing page
+        Builds a real cookie jar and referer chain that bot detectors expect.
+        """
         if self._warmed_up:
             return
-        try:
-            ua = random.choice(USER_AGENTS)
-            headers = _get_headers_for_ua(ua, "https://www.google.com/")
-            headers["Referer"] = "https://www.google.com/search?q=magicbricks+property+sale+india"
-            logger.info("[Session] Warming up — visiting homepage...")
-            r = self.session.get("https://www.magicbricks.com/", headers=headers, timeout=20)
-            if r.status_code == 200:
-                logger.info("[Session] Homepage OK — cookies acquired")
-            else:
-                logger.warning(f"[Session] Homepage returned {r.status_code}")
-            time.sleep(random.uniform(3.0, 6.0))
-            self._warmed_up = True
-        except Exception as e:
-            logger.warning(f"[Session] Warm-up failed (continuing anyway): {e}")
-            self._warmed_up = True  # don't retry warm-up in a loop
 
-    def get_random_user_agent(self) -> str:
-        """Get random user agent"""
-        return random.choice(USER_AGENTS)
-        
+        city_label = city or self.current_city or "Mumbai"
+        search_term = f"magicbricks property for sale {city_label.replace('-', ' ')}"
+        google_url = "https://www.google.com/search?q=" + search_term.replace(" ", "+") + "&hl=en-IN"
+
+        try:
+            logger.info(f"[Session] 1/3 Google search: '{search_term}'")
+            hdrs = {
+                "Accept-Language": random.choice(ACCEPT_LANGUAGES),
+                "Referer": "https://www.google.com/",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Dest": "document",
+                "Sec-CH-UA": self._profile["sec_ch_ua"],
+                "Sec-CH-UA-Mobile": self._profile["sec_ch_ua_mobile"],
+                "Sec-CH-UA-Platform": self._profile["sec_ch_ua_platform"],
+            }
+            r = self.session.get(google_url, headers=hdrs, timeout=20)
+            logger.info(f"[Session] 1/3 Google \u2192 {r.status_code}")
+            time.sleep(random.uniform(2.5, 5.0))
+
+            logger.info("[Session] 2/3 Landing on MagicBricks homepage (from Google)...")
+            hdrs2 = self._build_headers(referer=google_url)
+            hdrs2["Sec-Fetch-Site"] = "cross-site"
+            r2 = self.session.get("https://www.magicbricks.com/", headers=hdrs2, timeout=20)
+            logger.info(f"[Session] 2/3 Homepage \u2192 {r2.status_code} \u2014 {len(dict(r2.cookies))} cookies")
+            time.sleep(random.uniform(3.0, 7.0))
+
+            logger.info(f"[Session] 3/3 Navigating to city search: {city_label}")
+            search_url = f"{self.BASE_URL}?cityName={city_label}"
+            hdrs3 = self._build_headers(referer="https://www.magicbricks.com/")
+            r3 = self.session.get(search_url, headers=hdrs3, timeout=20)
+            logger.info(f"[Session] 3/3 City page \u2192 {r3.status_code} \u2014 warm-up complete \u2713")
+            time.sleep(random.uniform(3.0, 6.0))
+
+        except Exception as exc:
+            logger.warning(f"[Session] Warm-up failed (continuing anyway): {exc}")
+
+        self._warmed_up = True
+
+    # \u2500\u2500 URL helpers \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
     def set_city(self, city: str):
-        """Set current city for scraping"""
         self.current_city = city
         self.filters = {**self.BASE_FILTERS, "cityName": city}
-        
+
     def build_url(self, page: int = 1) -> str:
-        """Build URL with pagination parameters"""
-        params = "&".join([f"{k}={v}" for k, v in self.filters.items()])
+        params = "&".join(f"{k}={v}" for k, v in self.filters.items())
         return f"{self.BASE_URL}?{params}&page={page}"
-    
+
+    # \u2500\u2500 core fetch \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
     def fetch_page(self, url: str, page_num: int = 1, is_detail: bool = False) -> Optional[str]:
-        """Fetch a page with realistic browser behaviour, rotating UA/headers, and
-        exponential backoff on 403s (up to MAX_RETRIES attempts)."""
-
+        """
+        Fetch a URL with full evasion stack.
+        Returns HTML string on success, None on unrecoverable failure.
+        """
         MAX_RETRIES = 4
-        BASE_DELAY  = (4.0, 9.0)   # normal inter-request delay range (seconds)
-        BLOCK_DELAY = (15.0, 35.0) # extra pause after a 403 before retrying
+        # Gaussian delay: ~6s for listing pages, ~4s for detail pages
+        base_mu    = 4.0 if is_detail else 6.0
+        base_sigma = 1.5
 
-        # Warm up session on first real request
-        self._warm_up()
+        self._warm_up(self.current_city)
 
-        # Pick a referer that looks organic
-        if is_detail:
-            referer = self.BASE_URL + "?cityName=" + getattr(self, 'current_city', 'Mumbai')
-        else:
-            referer = "https://www.magicbricks.com/"
+        referer = (
+            self.build_url(max(1, page_num - 1)) if not is_detail
+            else self.BASE_URL + f"?cityName={self.current_city}"
+        )
 
         for attempt in range(1, MAX_RETRIES + 1):
+            delay = max(2.0, random.gauss(base_mu, base_sigma))
+            if attempt > 1:
+                delay += random.uniform(10.0, 20.0) * (attempt - 1)
+            time.sleep(delay)
+
             try:
-                ua = random.choice(USER_AGENTS)
-                headers = _get_headers_for_ua(ua, referer)
-
-                # Organic delay — longer for detail pages, longer on retries
-                delay = random.uniform(*BASE_DELAY)
-                if attempt > 1:
-                    delay += random.uniform(5.0, 10.0) * attempt
+                headers = self._build_headers(referer=referer)
                 if is_detail:
-                    delay *= random.uniform(0.8, 1.4)
-                time.sleep(delay)
+                    headers["Sec-Fetch-Site"] = "same-origin"
 
-                logger.info(f"[Page {page_num}] Fetching (attempt {attempt}/{MAX_RETRIES}): {url[:80]}...")
+                label = "Detail" if is_detail else "Page"
+                logger.info(f"[{label} {page_num}] Attempt {attempt}/{MAX_RETRIES}: {url[:80]}...")
 
-                response = self.session.get(url, headers=headers, timeout=20, allow_redirects=True)
+                resp = self.session.get(url, headers=headers, timeout=30, allow_redirects=True)
 
-                if response.status_code == 200:
-                    logger.info(f"[Page {page_num}] ✓ 200 OK — {len(response.text):,} chars")
-                    referer = url  # update referer for next hop
-                    return response.text
-
-                elif response.status_code == 403:
-                    backoff = random.uniform(*BLOCK_DELAY) * attempt
-                    logger.warning(f"[Page {page_num}] 403 Forbidden (attempt {attempt}) — backing off {backoff:.0f}s")
+                if resp.status_code in (403, 429):
+                    backoff = random.uniform(25.0, 55.0) * attempt
+                    logger.warning(
+                        f"[{label} {page_num}] {resp.status_code} (attempt {attempt}) \u2014 "
+                        f"rotating fingerprint + back-off {backoff:.0f}s"
+                    )
                     if attempt < MAX_RETRIES:
                         time.sleep(backoff)
-                        # Recreate session on repeated blocks to get fresh cookies
-                        if attempt >= 2:
-                            logger.info(f"[Page {page_num}] Recreating session for fresh cookies...")
-                            self.session = self._make_session()
-                            self._warmed_up = False
-                            self._warm_up()
+                        self._rotate_profile()
+                        self._warm_up(self.current_city)
                     else:
-                        logger.error(f"[Page {page_num}] Giving up after {MAX_RETRIES} attempts (403)")
+                        logger.error(f"[{label} {page_num}] Giving up after {MAX_RETRIES} attempts")
                         return None
+                    continue
 
-                elif response.status_code == 429:
-                    backoff = random.uniform(30.0, 60.0) * attempt
-                    logger.warning(f"[Page {page_num}] 429 Rate Limited — backing off {backoff:.0f}s")
-                    time.sleep(backoff)
-
-                else:
-                    logger.error(f"[Page {page_num}] Unexpected status {response.status_code}")
+                if resp.status_code != 200:
+                    logger.error(f"[{label} {page_num}] HTTP {resp.status_code} \u2014 aborting")
                     return None
 
-            except requests.exceptions.Timeout:
-                logger.warning(f"[Page {page_num}] Timeout on attempt {attempt}")
-                time.sleep(random.uniform(5.0, 12.0))
-            except requests.exceptions.ConnectionError as e:
-                logger.warning(f"[Page {page_num}] Connection error on attempt {attempt}: {e}")
-                time.sleep(random.uniform(8.0, 15.0))
-            except Exception as e:
-                logger.error(f"[Page {page_num}] Unexpected error: {e}")
-                return None
+                html = resp.text
+
+                # Soft-block: response too small for a real listing page
+                if not is_detail and len(html) < MIN_LISTING_PAGE_SIZE:
+                    logger.warning(f"[{label} {page_num}] Too small ({len(html):,} chars) \u2014 soft-block?")
+                    if attempt < MAX_RETRIES:
+                        self._rotate_profile()
+                        self._warm_up(self.current_city)
+                        continue
+
+                # Soft-block: CAPTCHA keywords in body
+                lower = html.lower()
+                blocked = next((kw for kw in SOFT_BLOCK_KEYWORDS if kw in lower), None)
+                if blocked:
+                    logger.warning(f"[{label} {page_num}] Soft-block keyword '{blocked}' \u2014 rotating")
+                    if attempt < MAX_RETRIES:
+                        time.sleep(random.uniform(20.0, 40.0))
+                        self._rotate_profile()
+                        self._warm_up(self.current_city)
+                    continue
+
+                logger.info(f"[{label} {page_num}] \u2713 200 OK \u2014 {len(html):,} chars")
+                referer = url
+                return html
+
+            except Exception as exc:
+                logger.warning(f"[Page {page_num}] Request error (attempt {attempt}): {exc}")
+                time.sleep(random.uniform(8.0, 16.0))
 
         return None
     
+    # \u2500\u2500 parsing \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
     def extract_property_listings(self, html: str, page_num: int = 1) -> List[Dict]:
-        """Extract property listing cards from page"""
+        """Extract property listing cards from a search-results page."""
         properties = []
-        new_count = 0
-        
         try:
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # Find all links to property detail pages
-            all_links = soup.find_all('a', href=re.compile(r'propertyDetails|/property/', re.I))
-            
+            soup = BeautifulSoup(html, "html.parser")
+            all_links = soup.find_all("a", href=re.compile(r"propertyDetails|/property/", re.I))
             logger.info(f"[Page {page_num}] Found {len(all_links)} property links")
-            
-            for idx, link in enumerate(all_links[:100]):
+
+            for link in all_links[:100]:
                 try:
-                    url = link.get('href', '').strip()
-                    
+                    url = link.get("href", "").strip()
                     if not url:
                         continue
-                    
-                    # Normalize URL
-                    if not url.startswith('http'):
-                        url = 'https://www.magicbricks.com' + url
-                    
-                    # Skip duplicates
+                    if not url.startswith("http"):
+                        url = "https://www.magicbricks.com" + url
                     if url in self.seen_urls:
                         continue
-                    
                     self.seen_urls.add(url)
-                    new_count += 1
-                    
-                    property_data = {'url': url}
-                    
-                    # Extract data from URL slug
-                    url_slug = url.split('/')[-1] if '/' in url else url
-                    
-                    # Extract BHK
-                    bhk_match = re.search(r'(\d+)-BHK', url_slug, re.I)
-                    if bhk_match:
-                        property_data['bhk'] = bhk_match.group(1)
-                    
-                    # Extract area
-                    area_match = re.search(r'(\d+)-Sq-(?:ft|yrd)', url_slug, re.I)
-                    if area_match:
-                        property_data['area_sqft'] = area_match.group(1)
-                    
-                    # Extract property type
-                    prop_types = ['Multistorey-Apartment', 'Builder-Floor-Apartment', 'Residential-House', 
-                                  'Villa', 'Penthouse', 'Studio-Apartment']
-                    for ptype in prop_types:
-                        if ptype in url_slug:
-                            property_data['property_type'] = ptype.replace('-', ' ')
+
+                    prop: Dict = {"url": url}
+                    slug = url.split("/")[-1] if "/" in url else url
+
+                    m = re.search(r"(\d+)-BHK", slug, re.I)
+                    if m:
+                        prop["bhk"] = m.group(1)
+
+                    m = re.search(r"(\d+)-Sq-(?:ft|yrd)", slug, re.I)
+                    if m:
+                        prop["area_sqft"] = m.group(1)
+
+                    for pt in [
+                        "Multistorey-Apartment", "Builder-Floor-Apartment",
+                        "Residential-House", "Villa", "Penthouse", "Studio-Apartment",
+                    ]:
+                        if pt in slug:
+                            prop["property_type"] = pt.replace("-", " ")
                             break
-                    
-                    # Extract location
-                    location_match = re.search(r'in-([A-Za-z-]+)&id', url_slug)
-                    if location_match:
-                        property_data['location'] = location_match.group(1).replace('-', ' ')
-                    
-                    # Build title
+
+                    m = re.search(r"in-([A-Za-z-]+)&id", slug)
+                    if m:
+                        prop["location"] = m.group(1).replace("-", " ")
+
                     parts = []
-                    if 'bhk' in property_data:
-                        parts.append(f"{property_data['bhk']} BHK")
-                    if 'property_type' in property_data:
-                        parts.append(property_data['property_type'])
-                    if 'location' in property_data:
-                        parts.append(f"in {property_data['location']}")
-                    property_data['title'] = ' '.join(parts) if parts else 'Property Listing'
-                    
-                    property_data['scraped_at'] = datetime.now().isoformat()
-                    properties.append(property_data)
-                
-                except Exception as e:
-                    logger.debug(f"Error extracting item {idx}: {str(e)}")
+                    if "bhk" in prop:       parts.append(f"{prop['bhk']} BHK")
+                    if "property_type" in prop: parts.append(prop["property_type"])
+                    if "location" in prop:  parts.append(f"in {prop['location']}")
+                    prop["title"] = " ".join(parts) or "Property Listing"
+                    prop["scraped_at"] = datetime.now().isoformat()
+                    properties.append(prop)
+
+                except Exception:
                     continue
-            
-            logger.info(f"[Page {page_num}] Extracted {new_count} new properties")
-            
-        except Exception as e:
-            logger.error(f"[Page {page_num}] Error parsing HTML: {str(e)}")
-        
+
+            logger.info(f"[Page {page_num}] Extracted {len(properties)} new properties")
+
+        except Exception as exc:
+            logger.error(f"[Page {page_num}] Parse error: {exc}")
+
         return properties
-    
+
     def extract_property_detail(self, html: str) -> Dict:
-        """Extract detailed information from property detail page"""
-        property_detail = {}
-        
+        """Extract price / area / BHK from a property detail page."""
+        detail: Dict = {}
         try:
-            soup = BeautifulSoup(html, 'html.parser')
+            soup = BeautifulSoup(html, "html.parser")
             text = soup.get_text()
-            
-            # Extract price
-            price_match = re.search(r'₹\s*([\d.,]+)\s*(?:Cr|Crore|Lac)', text)
-            if price_match:
-                property_detail['price'] = price_match.group(1).replace(',', '')
-                unit_match = re.search(r'₹\s*[\d.,]+\s*(Cr|Crore|Lac)', text)
-                if unit_match:
-                    property_detail['price_unit'] = unit_match.group(1)
-            
-            # Extract BHK
-            bhk_match = re.search(r'(\d+)\s*BHK', text)
-            if bhk_match:
-                property_detail['bhk'] = bhk_match.group(1)
-            
-            # Extract area
-            area_match = re.search(r'(\d+[.,]*\d*)\s*(?:Sq\.?\s*ft|sqft|sq\.ft)', text, re.I)
-            if area_match:
-                property_detail['area_sqft'] = area_match.group(1).replace(',', '')
-            
-            # Extract property type
-            for ptype in ['Apartment', 'Villa', 'House', 'Penthouse', 'Studio']:
-                if ptype.lower() in text.lower():
-                    property_detail['property_type'] = ptype
+
+            m = re.search(r"\u20b9\s*([\d.,]+)\s*(?:Cr|Crore|Lac)", text)
+            if m:
+                detail["price"] = m.group(1).replace(",", "")
+                um = re.search(r"\u20b9\s*[\d.,]+\s*(Cr|Crore|Lac)", text)
+                if um:
+                    detail["price_unit"] = um.group(1)
+
+            m = re.search(r"(\d+)\s*BHK", text)
+            if m:
+                detail["bhk"] = m.group(1)
+
+            m = re.search(r"(\d+[.,]*\d*)\s*(?:Sq\.?\s*ft|sqft|sq\.ft)", text, re.I)
+            if m:
+                detail["area_sqft"] = m.group(1).replace(",", "")
+
+            for pt in ["Apartment", "Villa", "House", "Penthouse", "Studio"]:
+                if pt.lower() in text.lower():
+                    detail["property_type"] = pt
                     break
-            
-            # Extract title
-            h1 = soup.find('h1')
+
+            h1 = soup.find("h1")
             if h1:
-                property_detail['title'] = h1.get_text(strip=True)
-            
-            property_detail['scraped_at'] = datetime.now().isoformat()
-            
-        except Exception as e:
-            logger.error(f"Error parsing property detail: {str(e)}")
-        
-        return property_detail
-    
-    def save_to_json(self, data: List[Dict], filename: str = "properties.json"):
-        """Save properties to JSON"""
-        try:
-            filepath = self.output_dir / filename
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            logger.info(f"[OK] Saved {len(data)} properties to {filename}")
-        except Exception as e:
-            logger.error(f"Error saving to JSON: {str(e)}")    
-    def append_property_jsonl(self, property_data: Dict, filename: str = "properties.jsonl"):
-        """Append single property to JSONL file (thread-safe)"""
+                detail["title"] = h1.get_text(strip=True)
+
+            detail["scraped_at"] = datetime.now().isoformat()
+
+        except Exception as exc:
+            logger.error(f"Detail parse error: {exc}")
+
+        return detail
+
+    # \u2500\u2500 file I/O \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+    def append_property_jsonl(self, data: Dict, filename: str = "properties.jsonl"):
         try:
             filepath = self.output_dir / filename
             with self.file_lock:
-                with open(filepath, 'a', encoding='utf-8') as f:
-                    json.dump(property_data, f, ensure_ascii=False)
-                    f.write('\n')
-        except Exception as e:
-            logger.error(f"Error appending to JSONL: {str(e)}")
-    
-    def append_property_csv(self, property_data: Dict, filename: str = "properties.csv"):
-        """Append single property to CSV file (thread-safe)"""
+                with open(filepath, "a", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
+                    f.write("\n")
+        except Exception as exc:
+            logger.error(f"JSONL write error: {exc}")
+
+    def append_property_csv(self, data: Dict, filename: str = "properties.csv"):
         try:
             filepath = self.output_dir / filename
-            
-            # Check if file exists to decide on header
-            file_exists = filepath.exists() and filepath.stat().st_size > 0
-            
+            exists = filepath.exists() and filepath.stat().st_size > 0
             with self.file_lock:
-                with open(filepath, 'a', newline='', encoding='utf-8') as f:
-                    writer = csv.DictWriter(f, fieldnames=sorted(property_data.keys()))
-                    
-                    if not file_exists:
+                with open(filepath, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=sorted(data.keys()))
+                    if not exists:
                         writer.writeheader()
-                    
-                    writer.writerow(property_data)
-        except Exception as e:
-            logger.error(f"Error appending to CSV: {str(e)}")    
-    def save_to_csv(self, data: List[Dict], filename: str = "properties.csv"):
-        """Save properties to CSV"""
-        try:
-            filepath = self.output_dir / filename
-            
-            if not data:
-                logger.warning("No data to save")
-                return
-            
-            all_keys = set()
-            for item in data:
-                all_keys.update(item.keys())
-            
-            with open(filepath, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=sorted(all_keys))
-                writer.writeheader()
-                writer.writerows(data)
-            
-            logger.info(f"[OK] Saved {len(data)} properties to {filename}")
-        except Exception as e:
-            logger.error(f"Error saving to CSV: {str(e)}")
+                    writer.writerow(data)
+        except Exception as exc:
+            logger.error(f"CSV write error: {exc}")
 
 
-def scrape_single_city_task(city: str, max_pages: int = 50, enable_details: bool = True, output_dir: str = None) -> Dict[str, int]:
-    """Helper function to scrape a single city. Used for parallel processing."""
-    
+# ── per-city task ────────────────────────────────────────────────────────────────
+
+def scrape_single_city_task(
+    city: str,
+    max_pages: int = 50,
+    enable_details: bool = True,
+    output_dir: str = None,
+) -> Dict[str, int]:
+    """Scrape one city end-to-end. Each call creates a fresh scraper instance."""
     try:
-        # Create a new scraper instance for this thread
-        scraper = MagicBricksInfiniteScraper(output_dir=output_dir)
+        effective_dir = output_dir or os.getenv("DATA_DIR") or str(
+            Path(__file__).parent.parent.parent / "data" / "raw"
+        )
+        scraper = MagicBricksInfiniteScraper(output_dir=effective_dir)
         scraper.set_city(city)
-        
-        city_properties = []
-        
-        # Phase 1: Scrape listings from multiple pages
+
+        city_props: List[Dict] = []
+
+        # Phase 1 — listing pages
         for page in range(1, max_pages + 1):
             url = scraper.build_url(page=page)
             html = scraper.fetch_page(url, page_num=page)
-            
             if not html:
-                logger.warning(f"[{city}] Page {page}: Failed to fetch, stopping.")
+                logger.warning(f"[{city}] Page {page}: fetch failed — stopping city.")
                 break
-            
-            properties = scraper.extract_property_listings(html, page_num=page)
-            city_properties.extend(properties)
-            
-            if not properties:
-                logger.info(f"[{city}] Page {page}: No new properties found, stopping.")
+            listings = scraper.extract_property_listings(html, page_num=page)
+            city_props.extend(listings)
+            if not listings:
+                logger.info(f"[{city}] Page {page}: no new listings — done.")
                 break
-        
-        logger.info(f"[{city}] Found {len(city_properties)} listings")
-        
-        # Phase 2: Fetch details and save
-        properties_saved = 0
-        if enable_details:
-            for idx, prop in enumerate(city_properties, 1):
-                try:
-                    detail_html = scraper.fetch_page(prop['url'], page_num=idx, is_detail=True)
-                    if detail_html:
-                        detail = scraper.extract_property_detail(detail_html)
-                        merged = {**prop, **detail}
-                    else:
-                        merged = prop
 
-                except Exception as e:
-                    logger.warning(f"[{city}] Error processing property {idx}: {str(e)}")
+        logger.info(f"[{city}] Listing phase complete: {len(city_props)} properties")
+
+        # Phase 2 — detail enrichment + save
+        saved = 0
+        for idx, prop in enumerate(city_props, 1):
+            try:
+                if enable_details:
+                    detail_html = scraper.fetch_page(prop["url"], page_num=idx, is_detail=True)
+                    merged = {**prop, **(scraper.extract_property_detail(detail_html) if detail_html else {})}
+                else:
                     merged = prop
-                
-                # Save property immediately
-                scraper.append_property_jsonl(merged, "magicbricks_all_cities.jsonl")
-                scraper.append_property_csv(merged, "magicbricks_all_cities.csv")
-                properties_saved += 1
-        else:
-            # If not fetching details, just save listings
-            for prop in city_properties:
-                scraper.append_property_jsonl(prop, "magicbricks_all_cities.jsonl")
-                scraper.append_property_csv(prop, "magicbricks_all_cities.csv")
-                properties_saved += 1
-        
-        logger.info(f"[{city}] Saved {properties_saved} properties")
-        return {"city": city, "total": properties_saved}
-        
-    except Exception as e:
-        logger.error(f"[{city}] Error during scraping: {str(e)}")
+            except Exception as exc:
+                logger.warning(f"[{city}] Detail error #{idx}: {exc}")
+                merged = prop
+
+            scraper.append_property_jsonl(merged, "magicbricks_all_cities.jsonl")
+            scraper.append_property_csv(merged, "magicbricks_all_cities.csv")
+            saved += 1
+            if saved % 10 == 0:
+                logger.info(f"[{city}] Saved {saved}/{len(city_props)} so far …")
+
+        logger.info(f"[{city}] Done — {saved} properties written.")
+        return {"city": city, "total": saved}
+
+    except Exception as exc:
+        logger.error(f"[{city}] Fatal error: {exc}", exc_info=True)
         return {"city": city, "total": 0}
 
 
-def scrape_infinite_parallel(max_pages: int = 50, enable_details: bool = True, max_workers: int = 1):
-    """Scrape properties in parallel across multiple cities.
-    max_workers defaults to 1 — running cities sequentially is far less likely
-    to trigger bot detection than hammering from multiple threads simultaneously.
-    Increase to 2 only if you are comfortable with a higher 403 rate.
+# ── main entry point ──────────────────────────────────────────────────────────────
+
+def scrape_infinite_parallel(
+    max_pages: int = 50,
+    enable_details: bool = True,
+    max_workers: int = 1,
+):
+    """Scrape all cities, sequentially by default (max_workers=1).
+
+    Running cities one-at-a-time dramatically reduces 403 risk on datacenter IPs.
+    Set max_workers=2 only if a residential proxy is configured via PROXY_URL.
     """
-    
-    script_dir = Path(__file__).parent
-    data_dir = script_dir.parent.parent / "data" / "raw"
-    
-    # Initialize scraper to set up paths
-    scraper = MagicBricksInfiniteScraper(output_dir=str(data_dir))
-    
-    # Initialize output files
-    jsonl_file = data_dir / "magicbricks_all_cities.jsonl"
-    csv_file = data_dir / "magicbricks_all_cities.csv"
-    
-    # Clear previous files
-    if jsonl_file.exists():
-        jsonl_file.unlink()
-    if csv_file.exists():
-        csv_file.unlink()
-    
-    print("\n" + "="*70)
-    print("MAGIC BRICKS INFINITE SCRAPER - PARALLEL MULTI-CITY MODE")
-    print(f"Max workers: {max_workers} | Pages per city: {max_pages}")
-    print(f"Details enrichment: {enable_details}")
-    print("="*70 + "\n")
-    
-    total_properties = 0
-    city_results = []
-    
-    # Run cities in parallel
+    DATA_DIR = os.getenv("DATA_DIR") or str(
+        Path(__file__).parent.parent.parent / "data" / "raw"
+    )
+    data_path = Path(DATA_DIR)
+    data_path.mkdir(parents=True, exist_ok=True)
+
+    jsonl_file = data_path / "magicbricks_all_cities.jsonl"
+    csv_file   = data_path / "magicbricks_all_cities.csv"
+
+    # Clear previous run
+    for f in (jsonl_file, csv_file):
+        if f.exists():
+            f.unlink()
+
+    cities = MagicBricksInfiniteScraper.CITIES
+    logger.info("=" * 70)
+    logger.info("MAGICBRICKS SCRAPER — PARALLEL MULTI-CITY MODE")
+    logger.info(f"  Cities      : {len(cities)}")
+    logger.info(f"  Max workers : {max_workers}")
+    logger.info(f"  Pages/city  : {max_pages}")
+    logger.info(f"  Details     : {enable_details}")
+    logger.info(f"  Proxy       : {'YES (' + PROXY_URL + ')' if PROXY_URL else 'NO (datacenter IP)'}")
+    logger.info(f"  Output dir  : {DATA_DIR}")
+    logger.info("=" * 70)
+
+    total = 0
+    city_results: List[Dict] = []
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all cities to the thread pool
-        futures = {
-            executor.submit(scrape_single_city_task, city, max_pages, enable_details, str(data_dir)): city 
-            for city in scraper.CITIES
-        }
-        
-        # Process results as they complete
-        completed_count = 0
-        for future in as_completed(futures):
-            completed_count += 1
-            city = futures[future]
+        futures = {}
+        for idx, city in enumerate(cities):
+            # Stagger submissions so threads don't all warm-up simultaneously
+            if idx > 0:
+                pause = random.uniform(30.0, 75.0)
+                logger.info(f"Inter-city pause: {pause:.0f}s before {city} …")
+                time.sleep(pause)
+            fut = executor.submit(scrape_single_city_task, city, max_pages, enable_details, DATA_DIR)
+            futures[fut] = city
+
+        for fut in as_completed(futures):
+            city = futures[fut]
             try:
-                result = future.result()
-                city_results.append(result)
-                total_properties += result["total"]
-                print(f"[{completed_count}/{len(scraper.CITIES)}] {city}: {result['total']} properties saved")
-            except Exception as e:
-                print(f"[ERROR] {city}: {str(e)}")
-                city_results.append({"city": city, "total": 0})
-    
-    # Read back data for statistics
-    print("\n" + "="*70)
-    print("FINAL STATISTICS")
-    print("="*70)
-    print(f"Total properties saved: {total_properties}")
-    
-    # Quick stats from JSONL file
-    properties_with_price = 0
-    properties_with_area = 0
-    properties_with_location = 0
-    properties_with_bhk = 0
-    cities_found = {}
-    
-    if jsonl_file.exists():
-        with open(jsonl_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
-                    prop = json.loads(line)
-                    if 'price' in prop and prop['price']:
-                        properties_with_price += 1
-                    if 'area_sqft' in prop and prop['area_sqft']:
-                        properties_with_area += 1
-                    if 'location' in prop and prop['location']:
-                        properties_with_location += 1
-                        cities_found[prop['location']] = cities_found.get(prop['location'], 0) + 1
-                    if 'bhk' in prop and prop['bhk']:
-                        properties_with_bhk += 1
-    
-    print(f"\nField completion:")
-    print(f"  With price: {properties_with_price}/{total_properties} ({100*properties_with_price//max(total_properties,1)}%)")
-    print(f"  With area: {properties_with_area}/{total_properties} ({100*properties_with_area//max(total_properties,1)}%)")
-    print(f"  With location: {properties_with_location}/{total_properties} ({100*properties_with_location//max(total_properties,1)}%)")
-    print(f"  With BHK: {properties_with_bhk}/{total_properties} ({100*properties_with_bhk//max(total_properties,1)}%)")
-    
-    print(f"\nProperties by location (top 10):")
-    for city, count in sorted(cities_found.items(), key=lambda x: x[1], reverse=True)[:10]:
-        print(f"  {city}: {count}")
-    
-    print(f"\nCity results:")
-    for result in sorted(city_results, key=lambda x: x['total'], reverse=True):
-        print(f"  {result['city']}: {result['total']}")
-    
-    print(f"\nOutput files:")
-    print(f"  - magicbricks_all_cities.jsonl ({jsonl_file.stat().st_size / 1024:.1f} KB)")
-    print(f"  - magicbricks_all_cities.csv ({csv_file.stat().st_size / 1024:.1f} KB)")
-    
-    return total_properties
+                result = fut.result()
+            except Exception as exc:
+                logger.error(f"[{city}] Unhandled exception: {exc}", exc_info=True)
+                result = {"city": city, "total": 0}
+            city_results.append(result)
+            total += result["total"]
+            logger.info(f"[Progress] {city}: {result['total']} saved  |  running total: {total}")
 
-
-def scrape_infinite(max_pages: int = 5, enable_details: bool = True):
-    """Scrape properties with infinite scroll simulation - saves incrementally
-    
-    NOTE: This is the sequential version. For parallel scraping across multiple cities,
-    use scrape_infinite_parallel() instead.
-    """
-    
-    script_dir = Path(__file__).parent
-    data_dir = script_dir.parent.parent / "data" / "raw"
-    
-    scraper = MagicBricksInfiniteScraper(output_dir=str(data_dir))
-    
-    # Initialize output files
-    jsonl_file = data_dir / "magicbricks_all_cities.jsonl"
-    csv_file = data_dir / "magicbricks_all_cities.csv"
-    
-    # Clear previous files
+    # Final summary
+    logger.info("=" * 70)
+    logger.info("SCRAPE COMPLETE")
+    logger.info(f"  Total properties : {total}")
+    for r in sorted(city_results, key=lambda x: x["total"], reverse=True):
+        logger.info(f"    {r['city']:20s} {r['total']:>5d}")
     if jsonl_file.exists():
-        jsonl_file.unlink()
+        logger.info(f"  JSONL size : {jsonl_file.stat().st_size / 1024:.1f} KB")
     if csv_file.exists():
-        csv_file.unlink()
-    
-    total_properties = 0
-    
-    print("\n" + "="*60)
-    print("MAGIC BRICKS INFINITE SCRAPER - MULTI-CITY MODE")
-    print("(Saving incrementally to disk)")
-    print("="*60 + "\n")
-    
-    # Loop through all cities
-    for city_idx, city in enumerate(scraper.CITIES, 1):
-        scraper.set_city(city)
-        print(f"\n{'='*60}")
-        print(f"CITY {city_idx}/{len(scraper.CITIES)}: {city}")
-        print('='*60 + "\n")
-        
-        # Phase 1: Scrape listings from multiple pages
-        print("PHASE 1: Fetching listings (paginated)...\n")
-        city_properties = []
-        
-        for page in range(1, max_pages + 1):
-            url = scraper.build_url(page=page)
-            html = scraper.fetch_page(url, page_num=page)
-            
-            if not html:
-                logger.warning(f"[{city}] Page {page}: Failed to fetch, stopping.")
-                break
-            
-            properties = scraper.extract_property_listings(html, page_num=page)
-            city_properties.extend(properties)
-            
-            if not properties:
-                logger.info(f"[{city}] Page {page}: No new properties found, stopping.")
-                break
-            
-            print(f"  Total unique properties in {city}: {len([p for p in city_properties if p['url'] not in scraper.seen_urls])}\n")
-        
-        print(f"\n[{city_idx}/{len(scraper.CITIES)}] {city}: Found {len(city_properties)} listings\n")
-        
-        # Phase 2: Fetch details for city properties and save immediately
-        if enable_details:
-            print(f"PHASE 2: Fetching property details for {city}...\n")
-            
-            for idx, prop in enumerate(city_properties, 1):
-                try:
-                    print(f"  [{idx}/{len(city_properties)}] {prop.get('location', 'N/A')} ({prop.get('bhk')} BHK)...", end='', flush=True)
-                    
-                    detail_html = scraper.fetch_page(prop['url'], page_num=idx)
-                    if detail_html:
-                        detail = scraper.extract_property_detail(detail_html)
-                        merged = {**prop, **detail}
-                        print(" [OK]")
-                    else:
-                        print(" [FAIL]")
-                        merged = prop
-                        
-                except Exception as e:
-                    logger.warning(f"Error processing property {idx}: {str(e)}")
-                    merged = prop
-                
-                # Save property immediately to disk
-                scraper.append_property_jsonl(merged, "magicbricks_all_cities.jsonl")
-                scraper.append_property_csv(merged, "magicbricks_all_cities.csv")
-                total_properties += 1
-                
-                # Print progress every 10 properties
-                if total_properties % 10 == 0:
-                    print(f"    [Total saved: {total_properties}]")
-            
-            print(f"\n[{city_idx}/{len(scraper.CITIES)}] {city}: Saved {len(city_properties)} enriched properties\n")
-    
-    # Read back data for statistics
-    print("\n" + "="*60)
-    print("FINAL STATISTICS")
-    print("="*60)
-    print(f"Total properties saved: {total_properties}")
-    
-    # Quick stats from JSONL file
-    properties_with_price = 0
-    properties_with_area = 0
-    properties_with_location = 0
-    properties_with_bhk = 0
-    cities_found = {}
-    
-    if jsonl_file.exists():
-        with open(jsonl_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
-                    prop = json.loads(line)
-                    if 'price' in prop and prop['price']:
-                        properties_with_price += 1
-                    if 'area_sqft' in prop and prop['area_sqft']:
-                        properties_with_area += 1
-                    if 'location' in prop and prop['location']:
-                        properties_with_location += 1
-                        cities_found[prop['location']] = cities_found.get(prop['location'], 0) + 1
-                    if 'bhk' in prop and prop['bhk']:
-                        properties_with_bhk += 1
-    
-    print(f"With price: {properties_with_price}")
-    print(f"With area: {properties_with_area}")
-    print(f"With location: {properties_with_location}")
-    print(f"With BHK: {properties_with_bhk}")
-    
-    print(f"\nProperties by location:")
-    for city, count in sorted(cities_found.items(), key=lambda x: x[1], reverse=True):
-        print(f"  {city}: {count}")
-    
-    print(f"\nOutput files:")
-    print(f"  - magicbricks_all_cities.jsonl (one JSON object per line)")
-    print(f"  - magicbricks_all_cities.csv")
-    
-    return total_properties
+        logger.info(f"  CSV  size  : {csv_file.stat().st_size / 1024:.1f} KB")
+    logger.info("=" * 70)
+
+    return total
 
 
 if __name__ == "__main__":
-    # Scrape 50 pages per city with detail enrichment
-    # This will fetch ~1,000-1,250 properties per city across all 10 major Indian cities
-    # Total expected: 10,000-12,500 properties
-    #
-    # Now using PARALLEL scraper (3 cities at a time for performance + safety)
-    # Use max_workers=2 for lighter load, max_workers=4 for more aggressive speed
-    scrape_infinite_parallel(max_pages=50, enable_details=True, max_workers=3)
+    scrape_infinite_parallel(max_pages=50, enable_details=True, max_workers=1)
