@@ -488,13 +488,33 @@ class MagicBricksInfiniteScraper:
             logger.error(f"CSV write error: {exc}")
 
 
-# ── per-city task ────────────────────────────────────────────────────────────────
+# ── parallel detail enrichment helper ────────────────────────────────────────
+
+def _fetch_and_save(
+    idx: int,
+    prop: Dict,
+    scraper: "MagicBricksInfiniteScraper",
+    enable_details: bool,
+) -> Dict:
+    """Worker unit: optionally fetch detail page and return merged record."""
+    try:
+        if enable_details:
+            detail_html = scraper.fetch_page(prop["url"], page_num=idx, is_detail=True)
+            return {**prop, **(scraper.extract_property_detail(detail_html) if detail_html else {})}
+        return prop
+    except Exception as exc:
+        logger.warning(f"[Detail #{idx}] {exc}")
+        return prop
+
+
+# ── per-city task ────────────────────────────────────────────────────────────────────────────
 
 def scrape_single_city_task(
     city: str,
     max_pages: int = 50,
     enable_details: bool = True,
     output_dir: str = None,
+    detail_workers: int = 1,
 ) -> Dict[str, int]:
     """Scrape one city end-to-end. Each call creates a fresh scraper instance."""
     try:
@@ -521,24 +541,29 @@ def scrape_single_city_task(
 
         logger.info(f"[{city}] Listing phase complete: {len(city_props)} properties")
 
-        # Phase 2 — detail enrichment + save
+        # Phase 2 — detail enrichment + save  (optionally parallel)
         saved = 0
-        for idx, prop in enumerate(city_props, 1):
-            try:
-                if enable_details:
-                    detail_html = scraper.fetch_page(prop["url"], page_num=idx, is_detail=True)
-                    merged = {**prop, **(scraper.extract_property_detail(detail_html) if detail_html else {})}
-                else:
-                    merged = prop
-            except Exception as exc:
-                logger.warning(f"[{city}] Detail error #{idx}: {exc}")
-                merged = prop
-
-            scraper.append_property_jsonl(merged, "magicbricks_all_cities.jsonl")
-            scraper.append_property_csv(merged, "magicbricks_all_cities.csv")
-            saved += 1
-            if saved % 10 == 0:
-                logger.info(f"[{city}] Saved {saved}/{len(city_props)} so far …")
+        if detail_workers > 1 and enable_details:
+            with ThreadPoolExecutor(max_workers=detail_workers) as dex:
+                futs = {
+                    dex.submit(_fetch_and_save, idx, prop, scraper, True): idx
+                    for idx, prop in enumerate(city_props, 1)
+                }
+                for fut in as_completed(futs):
+                    merged = fut.result()
+                    scraper.append_property_jsonl(merged, "magicbricks_all_cities.jsonl")
+                    scraper.append_property_csv(merged, "magicbricks_all_cities.csv")
+                    saved += 1
+                    if saved % 20 == 0:
+                        logger.info(f"[{city}] Saved {saved}/{len(city_props)} …")
+        else:
+            for idx, prop in enumerate(city_props, 1):
+                merged = _fetch_and_save(idx, prop, scraper, enable_details)
+                scraper.append_property_jsonl(merged, "magicbricks_all_cities.jsonl")
+                scraper.append_property_csv(merged, "magicbricks_all_cities.csv")
+                saved += 1
+                if saved % 20 == 0:
+                    logger.info(f"[{city}] Saved {saved}/{len(city_props)} …")
 
         logger.info(f"[{city}] Done — {saved} properties written.")
         return {"city": city, "total": saved}
@@ -548,17 +573,24 @@ def scrape_single_city_task(
         return {"city": city, "total": 0}
 
 
-# ── main entry point ──────────────────────────────────────────────────────────────
+# ── main entry point ──────────────────────────────────────────────────────────
 
 def scrape_infinite_parallel(
-    max_pages: int = 50,
+    max_pages: int = 15,
     enable_details: bool = True,
     max_workers: int = 1,
+    detail_workers: int = 1,
 ):
-    """Scrape all cities, sequentially by default (max_workers=1).
+    """
+    Scrape all cities with up to `max_workers` cities running concurrently.
 
-    Running cities one-at-a-time dramatically reduces 403 risk on datacenter IPs.
-    Set max_workers=2 only if a residential proxy is configured via PROXY_URL.
+    max_workers=1  — safe/sequential (Railway fallback)
+    max_workers=3  — 3 cities in parallel (GitHub Actions recommended)
+    detail_workers — concurrent detail-page fetches *within* each city worker
+
+    Submission stagger:
+      - parallel mode (>1 workers): 3-8s offset so warmups don't collide
+      - sequential mode (1 worker) : 0s (city starts immediately after previous finishes)
     """
     DATA_DIR = os.getenv("DATA_DIR") or str(
         Path(__file__).parent.parent.parent / "data" / "raw"
@@ -577,12 +609,13 @@ def scrape_infinite_parallel(
     cities = MagicBricksInfiniteScraper.CITIES
     logger.info("=" * 70)
     logger.info("MAGICBRICKS SCRAPER — PARALLEL MULTI-CITY MODE")
-    logger.info(f"  Cities      : {len(cities)}")
-    logger.info(f"  Max workers : {max_workers}")
-    logger.info(f"  Pages/city  : {max_pages}")
-    logger.info(f"  Details     : {enable_details}")
-    logger.info(f"  Proxy       : {'YES (' + PROXY_URL + ')' if PROXY_URL else 'NO (datacenter IP)'}")
-    logger.info(f"  Output dir  : {DATA_DIR}")
+    logger.info(f"  Cities         : {len(cities)}")
+    logger.info(f"  City workers   : {max_workers}")
+    logger.info(f"  Detail workers : {detail_workers}")
+    logger.info(f"  Pages/city     : {max_pages}")
+    logger.info(f"  Details        : {enable_details}")
+    logger.info(f"  Proxy          : {'YES (' + PROXY_URL + ')' if PROXY_URL else 'NO (datacenter IP)'}")
+    logger.info(f"  Output dir     : {DATA_DIR}")
     logger.info("=" * 70)
 
     total = 0
@@ -591,14 +624,19 @@ def scrape_infinite_parallel(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
         for idx, city in enumerate(cities):
-            # Stagger submissions so threads don't all warm-up simultaneously
-            if idx > 0:
-                pause = random.uniform(30.0, 75.0)
-                logger.info(f"Inter-city pause: {pause:.0f}s before {city} …")
-                time.sleep(pause)
-            fut = executor.submit(scrape_single_city_task, city, max_pages, enable_details, DATA_DIR)
+            if max_workers > 1 and idx > 0:
+                # Tiny offset so multiple warmups don't hit Google/MB simultaneously
+                stagger = random.uniform(3.0, 8.0)
+                logger.info(f"[Submit] stagger {stagger:.1f}s before {city}")
+                time.sleep(stagger)
+            fut = executor.submit(
+                scrape_single_city_task,
+                city, max_pages, enable_details, DATA_DIR, detail_workers,
+            )
             futures[fut] = city
+            logger.info(f"[Submit] {city} queued ({len(futures)}/{len(cities)})")
 
+        logger.info(f"All {len(cities)} cities queued — running up to {max_workers} concurrently")
         for fut in as_completed(futures):
             city = futures[fut]
             try:
@@ -608,7 +646,8 @@ def scrape_infinite_parallel(
                 result = {"city": city, "total": 0}
             city_results.append(result)
             total += result["total"]
-            logger.info(f"[Progress] {city}: {result['total']} saved  |  running total: {total}")
+            done = len(city_results)
+            logger.info(f"[Progress {done}/{len(cities)}] {city}: {result['total']} saved | total so far: {total}")
 
     # Final summary
     logger.info("=" * 70)
@@ -626,4 +665,18 @@ def scrape_infinite_parallel(
 
 
 if __name__ == "__main__":
-    scrape_infinite_parallel(max_pages=50, enable_details=True, max_workers=1)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="MagicBricks property scraper")
+    parser.add_argument("--pages",          type=int,  default=15,   help="Pages per city (default 15)")
+    parser.add_argument("--workers",        type=int,  default=1,    help="Concurrent city workers (default 1)")
+    parser.add_argument("--detail-workers", type=int,  default=1,    help="Concurrent detail requests per city (default 1)")
+    parser.add_argument("--no-details",     action="store_true",     help="Skip detail-page enrichment")
+    args = parser.parse_args()
+
+    scrape_infinite_parallel(
+        max_pages=args.pages,
+        enable_details=not args.no_details,
+        max_workers=args.workers,
+        detail_workers=args.detail_workers,
+    )

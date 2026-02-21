@@ -40,7 +40,10 @@ jobs:
           mkdir -p data/raw
           echo "=== Starting MagicBricks scraper on GitHub Actions runner ==="
           echo "Runner IP: $(curl -s https://api.ipify.org)"
-          python src/scrapers/magicbricks_scraper.py
+          python src/scrapers/magicbricks_scraper.py \
+            --workers 3 \
+            --detail-workers 2 \
+            --pages 15
           echo "=== Scraper finished ==="
 
       - name: Check output
