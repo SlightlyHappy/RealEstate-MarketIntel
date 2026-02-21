@@ -3,7 +3,7 @@ FastAPI Server for Railway Deployment
 Serves Market Intelligence API + Scheduled Scraper/Retraining
 """
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -567,8 +567,59 @@ def market_insights():
 
 
 # ============================================================================
+# HELPERS
+# ============================================================================
+
+def _retrain_and_reload():
+    """Background task: retrain ML model then hot-reload it into memory."""
+    logger.info("🔁 Background retrain triggered by /admin/ingest")
+    if run_model_retraining():
+        load_models()
+        logger.info("✅ Background retrain + reload complete")
+    else:
+        logger.error("❌ Background retrain failed — check Railway logs")
+
+
+# ============================================================================
 # ADMIN ENDPOINTS (Protected)
 # ============================================================================
+
+@app.post("/admin/ingest", tags=["Admin"])
+async def ingest_scraped_data(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_api_key: str = Header(None),
+):
+    """
+    Receive JSONL scraped data from GitHub Actions and trigger retraining.
+    Body  : raw JSONL — one JSON object per line (Content-Type: application/x-ndjson)
+    Header: X-API-Key: <ADMIN_API_KEY>
+    """
+    if x_api_key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
+    try:
+        body = await request.body()
+        if not body:
+            raise HTTPException(status_code=400, detail="Empty body")
+        line_count = body.count(b'\n')
+        logger.info(f"📥 /admin/ingest: {len(body):,} bytes  ~{line_count} properties")
+        out_path = DATA_DIR / "magicbricks_all_cities.jsonl"
+        with open(out_path, "wb") as f:
+            f.write(body)
+        logger.info(f"   ✓ Written to {out_path}")
+        background_tasks.add_task(_retrain_and_reload)
+        return {
+            "status": "accepted",
+            "properties_received": line_count,
+            "message": "Data written; model retraining queued in background",
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ingest error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/admin/trigger-scraper", tags=["Admin"])
 def trigger_scraper_manual(x_api_key: str = Header(None)):
@@ -727,57 +778,25 @@ def scheduler_status_endpoint(x_api_key: str = Header(None)):
 # ============================================================================
 
 def scheduled_weekly_update():
-    """Scheduled task: Run every Sunday at 2 AM UTC"""
+    """Fallback scheduled task: Sunday 2:30 AM UTC.
+    Scraping is now handled by GitHub Actions (Sunday 1 AM UTC) which calls
+    /admin/ingest directly.  This fallback retrains on whatever data is already
+    on the persistent volume — useful if Actions fails or is disabled.
+    """
     start_time = datetime.utcnow()
     logger.info(f"\n{'='*70}")
-    logger.info(f"🔄 [SCHEDULED TASK TRIGGERED] {start_time.isoformat()}")
+    logger.info(f"🔄 [SCHEDULED FALLBACK RETRAIN] {start_time.isoformat()}")
+    logger.info("   (Scraping delegated to GitHub Actions — this just retrains)")
     logger.info("="*70)
-    
+
     try:
         # ==================================================================
-        # STEP 1: RUN SCRAPER
-        # ==================================================================
-        step1_start = datetime.utcnow()
-        logger.info(f"\n📊 STEP 1/3: Running property scraper...")
-        logger.info(f"   Start time: {step1_start.isoformat()}")
-        logger.info(f"   Configuration: 10 cities × 15 pages = ~1000 properties")
-        
-        try:
-            import sys
-            sys.path.insert(0, "/app/src/scrapers")
-            from magicbricks_scraper import scrape_infinite_parallel
-            
-            logger.info(f"   ✓ Scraper module loaded successfully")
-            logger.info(f"   ✓ Output directory: {DATA_DIR}")
-            logger.info(f"\n   🚀 Starting scraper...\n")
-            
-            # Run scraper with detailed output
-            total_scraped = scrape_infinite_parallel(max_pages=15, enable_details=True, max_workers=1)
-            
-            step1_end = datetime.utcnow()
-            step1_duration = (step1_end - step1_start).total_seconds()
-            
-            logger.info(f"\n✅ STEP 1 COMPLETE: Scraper finished successfully")
-            logger.info(f"   Properties scraped: {total_scraped}")
-            logger.info(f"   Duration: {step1_duration:.1f} seconds ({step1_duration/60:.1f} minutes)")
-            logger.info(f"   End time: {step1_end.isoformat()}")
-            
-        except ImportError as ie:
-            logger.error(f"❌ IMPORT ERROR: Could not import scraper module")
-            logger.error(f"   Error: {ie}", exc_info=True)
-            raise
-        except Exception as scraper_err:
-            logger.error(f"❌ STEP 1 FAILED: Scraper execution error")
-            logger.error(f"   Error: {scraper_err}", exc_info=True)
-            raise
-        
-        # ==================================================================
-        # STEP 2: RETRAIN ML MODEL
+        # STEP 1: RETRAIN ML MODEL  (was Step 2 — scraper removed from Railway)
         # ==================================================================
         step2_start = datetime.utcnow()
         logger.info(f"\n🧠 STEP 2/3: Retraining ML model...")
         logger.info(f"   Start time: {step2_start.isoformat()}")
-        logger.info(f"   Loading scraped data...")
+        logger.info(f"   Loading scraped data (STEP 1/2)...")
         
         try:
             # Load data to get stats
@@ -795,24 +814,25 @@ def scheduled_weekly_update():
             if run_model_retraining():
                 step2_end = datetime.utcnow()
                 step2_duration = (step2_end - step2_start).total_seconds()
-                
-                logger.info(f"\n✅ STEP 2 COMPLETE: Model retraining successful")
+                logger.info(f"\n✅ STEP 1 COMPLETE: Model retraining successful")
                 logger.info(f"   Duration: {step2_duration:.1f} seconds ({step2_duration/60:.1f} minutes)")
                 logger.info(f"   Models saved to: {MODEL_DIR}")
                 logger.info(f"   End time: {step2_end.isoformat()}")
             else:
-                logger.warning(f"⚠️  STEP 2 PARTIAL: Model retraining had issues")
+                step2_end = datetime.utcnow()
+                step2_duration = (step2_end - step2_start).total_seconds()
+                logger.warning(f"⚠️  STEP 1 PARTIAL: Model retraining had issues")
                 logger.warning(f"   Continuing with existing models...")
         except Exception as retrain_err:
-            logger.error(f"❌ STEP 2 FAILED: Model retraining error")
+            logger.error(f"❌ STEP 1 FAILED: Model retraining error")
             logger.error(f"   Error: {retrain_err}", exc_info=True)
             raise
         
         # ==================================================================
-        # STEP 3: RELOAD MODELS INTO MEMORY
+        # STEP 2: RELOAD MODELS INTO MEMORY
         # ==================================================================
         step3_start = datetime.utcnow()
-        logger.info(f"\n🔄 STEP 3/3: Reloading models into memory...")
+        logger.info(f"\n🔄 STEP 2/2: Reloading models into memory...")
         logger.info(f"   Start time: {step3_start.isoformat()}")
         
         try:
@@ -825,12 +845,12 @@ def scheduled_weekly_update():
             step3_end = datetime.utcnow()
             step3_duration = (step3_end - step3_start).total_seconds()
             
-            logger.info(f"✅ STEP 3 COMPLETE: Models reloaded into memory")
+            logger.info(f"✅ STEP 2 COMPLETE: Models reloaded into memory")
             logger.info(f"   Duration: {step3_duration:.1f} seconds")
             logger.info(f"   Data points: {len(market_data) if market_data is not None else 0}")
             logger.info(f"   End time: {step3_end.isoformat()}")
         except Exception as load_err:
-            logger.error(f"❌ STEP 3 FAILED: Model reload error")
+            logger.error(f"❌ STEP 2 FAILED: Model reload error")
             logger.error(f"   Error: {load_err}", exc_info=True)
             raise
         
@@ -845,9 +865,8 @@ def scheduled_weekly_update():
         logger.info(f"{'='*70}")
         logger.info(f"\n📈 SUMMARY:")
         logger.info(f"   Total time: {total_duration:.1f} seconds ({total_duration/60:.1f} minutes)")
-        logger.info(f"   Step 1 (Scraper): {(step1_duration/total_duration*100):.0f}%")
-        logger.info(f"   Step 2 (Training): {(step2_duration/total_duration*100):.0f}%")
-        logger.info(f"   Step 3 (Reload): {(step3_duration/total_duration*100):.0f}%")
+        logger.info(f"   Step 1 (Training): {(step2_duration/total_duration*100):.0f}%")
+        logger.info(f"   Step 2 (Reload): {(step3_duration/total_duration*100):.0f}%")
         logger.info(f"   Completed at: {end_time.isoformat()}")
         logger.info(f"\n   📊 Next update: {(end_time + pd.Timedelta(days=7)).isoformat()}")
         logger.info(f"{'='*70}\n")
@@ -878,8 +897,8 @@ scheduler.add_job(
     scheduled_weekly_update,
     'cron',
     day_of_week='6',      # Sunday (0=Monday, 6=Sunday in APScheduler)
-    hour='2',              # 2 AM UTC
-    minute='0',            # 00 minutes
+    hour='2',              # 2:30 AM UTC (Actions runs at 1 AM, done before this)
+    minute='30',           # 30 minutes
     id='scheduled_weekly_update'
 )
 
@@ -887,7 +906,7 @@ scheduler.add_job(
 def start_scheduler():
     try:
         scheduler.start()
-        logger.info("✅ APScheduler STARTED - weekly updates at Sunday 2 AM UTC")
+        logger.info("✅ APScheduler STARTED - fallback retrain at Sunday 2:30 AM UTC")
         logger.info(f"   Jobs scheduled: {[job.id for job in scheduler.get_jobs()]}")
     except Exception as e:
         logger.error(f"❌ Failed to start scheduler: {e}", exc_info=True)
