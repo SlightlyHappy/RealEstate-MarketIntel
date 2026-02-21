@@ -55,13 +55,31 @@ In your Next.js environment variables:
 RAILWAY_API_URL=https://your-app.up.railway.app
 ```
 
-## Monitoring
+## Monitoring Scheduler
 
-View logs in Railway dashboard:
+The system runs **every Sunday 2 AM UTC** automatically. To check its status:
+
 ```bash
-# Latest logs show scheduler running weekly
-[2026-02-26 02:00:00] Starting weekly market intelligence update
-[2026-02-26 02:15:00] ✅ Weekly update successful!
+# Check if scheduler is running and when next job fires
+curl -H "X-API-Key: your-secret-key-here" \
+  https://your-app.up.railway.app/admin/scheduler-status
+
+# Response shows next_run_time (should be next Sunday 2 AM UTC)
+```
+
+## Testing the Scheduler
+
+Don't want to wait for Sunday? Test immediately:
+
+```bash
+# Manually run the weekly update (scrape + retrain + reload)
+curl -X POST \
+  -H "X-API-Key: your-secret-key-here" \
+  https://your-app.up.railway.app/admin/test-scheduler
+
+# This runs the ENTIRE weekly pipeline immediately
+# Completes in ~2-5 minutes
+# Check Railway logs for progress
 ```
 
 ## Manual Trigger (if needed)
@@ -73,7 +91,7 @@ curl -X POST https://your-app.up.railway.app/admin/trigger-scraper \
 
 ## What Happens Automatically
 
-- **Every 7 days at 2 AM UTC:**
+- **Every Sunday 2 AM UTC:**
   1. Scraper runs and collects new properties from Magic Bricks
   2. ML model retrains on latest data
   3. API reloads models (zero downtime)
@@ -81,6 +99,25 @@ curl -X POST https://your-app.up.railway.app/admin/trigger-scraper \
 
 - **Data persists** to the `/data` volume across deployments
 - **Logs saved** to `/data/logs/` for troubleshooting
+
+## Expected Log Output
+
+When the scheduler runs ( automatically on Sunday or via `/admin/test-scheduler`):
+
+```
+======================================================================
+🔄 [SCHEDULED TASK TRIGGERED] 2026-02-22T02:00:00.000000Z
+======================================================================
+STEP 1/3: Running property scraper...
+✅ STEP 1 COMPLETE: Scraper completed successfully
+STEP 2/3: Retraining ML model...
+✅ STEP 2 COMPLETE: Model retraining successful
+STEP 3/3: Reloading models into memory...
+✅ STEP 3 COMPLETE: Models reloaded
+======================================================================
+✅ SUCCESS: Weekly update completed in 142.5s
+======================================================================
+```
 
 ## Cost Estimate (on Railway)
 
@@ -95,12 +132,23 @@ curl -X POST https://your-app.up.railway.app/admin/trigger-scraper \
    - Wait 2 minutes and try again
 
 2. **Data not updating**
-   - Check Railway logs for scheduler errors
-   - Manually trigger: `POST /admin/trigger-scraper`
+   - Check scheduler status: `GET /admin/scheduler-status`
+   - Next run time should show next Sunday 2 AM UTC
+   - To test immediately: `POST /admin/test-scheduler`
+   - Check Railway logs for any errors (look for FAILURE)
 
-3. **Volume not persisting**
+3. **Scheduler shows as "Stopped"**
+   - Restart Railway deployment
+   - Check logs for startup errors
+   - Ensure `pytz` is in requirements.txt
+
+4. **Volume not persisting**
    - Verify volume is mounted at `/data`
    - Check Railway dashboard under Volumes
+
+5. **For detailed troubleshooting**
+   - See [SCHEDULER_DEBUGGING.md](SCHEDULER_DEBUGGING.md)
+   - See [SCHEDULER_FIX_SUMMARY.md](SCHEDULER_FIX_SUMMARY.md)
 
 ---
 

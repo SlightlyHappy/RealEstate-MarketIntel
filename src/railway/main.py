@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from apscheduler.schedulers.background import BackgroundScheduler
+from pytz import utc
 import pickle
 import pandas as pd
 import numpy as np
@@ -121,11 +122,13 @@ def run_model_retraining():
     """Full retraining pipeline - called weekly or manually"""
     global model_rf, le_location, le_ptype, market_data, last_update_time
     
-    logger.info("🔄 Starting model retraining...")
+    logger.info("🔄 Starting full model retraining pipeline...")
     
     try:
         # Load and prepare data
         data_path = DATA_DIR / "magicbricks_all_cities.jsonl"
+        logger.info(f"  📂 Reading data from: {data_path}")
+        
         records = []
         with open(data_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -133,57 +136,79 @@ def run_model_retraining():
                     records.append(json.loads(line))
         
         df = pd.DataFrame(records)
-        logger.info(f"Loaded {len(df)} total properties")
+        logger.info(f"     ✓ Loaded {len(df)} total properties")
         
         # Clean data
+        logger.info(f"\n  🧹 Normalizing prices and cleaning data...")
         df = normalize_prices(df)
+        initial_count = len(df)
         df = clean_data(df)
+        cleaned_count = len(df)
+        logger.info(f"     ✓ Removed {initial_count - cleaned_count} invalid records")
+        logger.info(f"     ✓ Kept {cleaned_count} clean properties")
         
         # Feature engineering
+        logger.info(f"\n  🔧 Feature engineering...")
         df, le_location, le_ptype = feature_engineering(df)
-        
-        logger.info(f"Training on {len(df)} cleaned properties, {df['location_grouped'].nunique()} locations")
+        logger.info(f"     ✓ Identified {df['location_grouped'].nunique()} major locations")
+        logger.info(f"     ✓ Property types: {df['ptype_encoded'].nunique()}")
         
         # Prepare training data
+        logger.info(f"\n  📊 Preparing training data...")
         feature_cols = ['bhk', 'area_sqft', 'location_encoded', 'ptype_encoded', 'price_per_sqft']
         X = df[feature_cols].values
         y = df['price_cr'].values
+        logger.info(f"     ✓ Features: {feature_cols}")
+        logger.info(f"     ✓ Samples: {len(X)}")
         
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42
         )
+        logger.info(f"     ✓ Train set: {len(X_train)} samples")
+        logger.info(f"     ✓ Test set: {len(X_test)} samples")
         
         # Train Random Forest
-        logger.info("Training Random Forest...")
+        logger.info(f"\n  🧠 Training Random Forest model...")
+        logger.info(f"     Configuration: 100 trees, max_depth=20")
         model_rf = RandomForestRegressor(n_estimators=100, max_depth=20, random_state=42, n_jobs=-1)
         model_rf.fit(X_train, y_train)
+        logger.info(f"     ✓ Training completed")
         
         # Evaluate
+        logger.info(f"\n  📈 Evaluating model performance...")
         y_pred = model_rf.predict(X_test)
         mae = mean_absolute_error(y_test, y_pred)
         r2 = r2_score(y_test, y_pred)
         
-        logger.info(f"Model Performance - MAE: {mae:.4f} Cr, R²: {r2:.4f}")
+        logger.info(f"     ✓ Mean Absolute Error: {mae:.4f} Crores")
+        logger.info(f"     ✓ R² Score: {r2:.4f} ({r2*100:.2f}% variance explained)")
+        logger.info(f"     ✓ Model Accuracy: {r2*100:.1f}%")
         
         # Save models
+        logger.info(f"\n  💾 Saving models to disk...")
         model_path = MODEL_DIR / "price_predictor_rf.pkl"
         encoder_path = MODEL_DIR / "encoders.pkl"
         
         with open(model_path, 'wb') as f:
             pickle.dump(model_rf, f)
+        logger.info(f"     ✓ Saved: {model_path}")
+        
         with open(encoder_path, 'wb') as f:
             pickle.dump((le_location, le_ptype), f)
-        
-        logger.info(f"✅ Models saved to {MODEL_DIR}")
+        logger.info(f"     ✓ Saved: {encoder_path}")
         
         # Update global state
         market_data = df
         last_update_time = datetime.utcnow()
         
+        logger.info(f"\n✅ Model retraining pipeline completed successfully")
+        logger.info(f"   - {len(df)} properties in production")
+        logger.info(f"   - {df['location_grouped'].nunique()} locations supported")
+        
         return True
         
     except Exception as e:
-        logger.error(f"❌ Model retraining failed: {e}")
+        logger.error(f"❌ Model retraining failed: {e}", exc_info=True)
         return False
 
 
@@ -285,12 +310,27 @@ def load_models():
 # Load models on startup
 @app.on_event("startup")
 async def startup():
-    # First, initialize persistent volume from repo if needed
-    initialize_persistent_volume()
+    logger.info("\n" + "="*70)
+    logger.info("🚀 APPLICATION STARTUP - PropertyIntel Market Intelligence API")
+    logger.info("="*70)
     
-    # Then load models
-    if not load_models():
-        logger.warning("Models not loaded - API will return errors until models are available")
+    try:
+        # First, initialize persistent volume from repo if needed
+        logger.info("1️⃣  Initializing persistent volume...")
+        initialize_persistent_volume()
+        logger.info("   ✅ Persistent volume ready")
+    except Exception as e:
+        logger.error(f"   ❌ Persistent volume init failed: {e}", exc_info=True)
+    
+    try:
+        # Then load models
+        logger.info("2️⃣  Loading ML models...")
+        if load_models():
+            logger.info("   ✅ Models loaded successfully")
+        else:
+            logger.warning("   ⚠️  Models not loaded - API will return errors until models are available")
+    except Exception as e:
+        logger.error(f"   ❌ Model loading failed: {e}", exc_info=True)
 
 
 # ============================================================================
@@ -608,62 +648,249 @@ def retrain_model_endpoint(x_api_key: str = Header(None)):
         raise HTTPException(status_code=500, detail=f"Retraining failed: {str(e)}")
 
 
+@app.post("/admin/test-scheduler", tags=["Admin"])
+def test_scheduler_endpoint(x_api_key: str = Header(None)):
+    """
+    Manually test the scheduled weekly update (Admin only)
+    Runs the same pipeline as the scheduled task but immediately
+    Header: X-API-Key: <ADMIN_API_KEY>
+    """
+    if x_api_key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
+    
+    try:
+        logger.info("🧪 TEST: Running scheduled_weekly_update manually...")
+        success = scheduled_weekly_update()
+        
+        if success:
+            return {
+                "status": "Success",
+                "message": "Test scheduler run completed successfully",
+                "timestamp": datetime.utcnow().isoformat(),
+                "next_scheduled": "Sunday 2 AM UTC"
+            }
+        else:
+            return {
+                "status": "Partial Failure",
+                "message": "Test scheduler run had errors - check logs",
+                "timestamp": datetime.utcnow().isoformat(),
+                "check_logs": "/data/logs/"
+            }
+        
+    except Exception as e:
+        logger.error(f"Test scheduler error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Test scheduler failed: {str(e)}")
+
+
+@app.get("/admin/scheduler-status", tags=["Admin"])
+def scheduler_status_endpoint(x_api_key: str = Header(None)):
+    """
+    Get scheduler status and next run time (Admin only)
+    Header: X-API-Key: <ADMIN_API_KEY>
+    """
+    if x_api_key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
+    
+    try:
+        jobs = scheduler.get_jobs()
+        
+        job_details = []
+        for job in jobs:
+            job_details.append({
+                "id": job.id,
+                "func": str(job.func),
+                "trigger": str(job.trigger),
+                "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
+                "timezone": str(job.timezone) if hasattr(job, 'timezone') else "N/A"
+            })
+        
+        return {
+            "status": "Running" if scheduler.running else "Stopped",
+            "jobs": job_details,
+            "server_time": datetime.utcnow().isoformat(),
+            "server_timezone": "UTC"
+        }
+        
+    except Exception as e:
+        logger.error(f"Scheduler status error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get scheduler status: {str(e)}")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Retrain error: {e}")
+        raise HTTPException(status_code=500, detail=f"Retraining failed: {str(e)}")
+
+
 # ============================================================================
 # BACKGROUND SCHEDULER
 # ============================================================================
 
 def scheduled_weekly_update():
-    """Scheduled task: Run every 7 days"""
-    logger.info(f"\n{'='*60}")
-    logger.info(f"[{datetime.utcnow()}] Starting weekly market intelligence update")
-    logger.info("="*60)
+    """Scheduled task: Run every Sunday at 2 AM UTC"""
+    start_time = datetime.utcnow()
+    logger.info(f"\n{'='*70}")
+    logger.info(f"🔄 [SCHEDULED TASK TRIGGERED] {start_time.isoformat()}")
+    logger.info("="*70)
     
     try:
-        # Step 1: Run scraper
-        logger.info("Step 1/3: Running property scraper...")
-        import sys
-        sys.path.insert(0, "/app/src/scrapers")
-        from magicbricks_scraper import scrape_infinite_parallel
-        scrape_infinite_parallel(max_pages=15, enable_details=True, max_workers=2)
-        logger.info("✅ Scraper completed")
+        # ==================================================================
+        # STEP 1: RUN SCRAPER
+        # ==================================================================
+        step1_start = datetime.utcnow()
+        logger.info(f"\n📊 STEP 1/3: Running property scraper...")
+        logger.info(f"   Start time: {step1_start.isoformat()}")
+        logger.info(f"   Configuration: 10 cities × 15 pages = ~1000 properties")
         
-        # Step 2: Retrain model
-        logger.info("Step 2/3: Retraining ML model...")
-        if run_model_retraining():
-            logger.info("✅ Model retraining completed")
-        else:
-            logger.error("❌ Model retraining failed - using existing models")
+        try:
+            import sys
+            sys.path.insert(0, "/app/src/scrapers")
+            from magicbricks_scraper import scrape_infinite_parallel
+            
+            logger.info(f"   ✓ Scraper module loaded successfully")
+            logger.info(f"   ✓ Output directory: {DATA_DIR}")
+            logger.info(f"\n   🚀 Starting scraper...\n")
+            
+            # Run scraper with detailed output
+            total_scraped = scrape_infinite_parallel(max_pages=15, enable_details=True, max_workers=2)
+            
+            step1_end = datetime.utcnow()
+            step1_duration = (step1_end - step1_start).total_seconds()
+            
+            logger.info(f"\n✅ STEP 1 COMPLETE: Scraper finished successfully")
+            logger.info(f"   Properties scraped: {total_scraped}")
+            logger.info(f"   Duration: {step1_duration:.1f} seconds ({step1_duration/60:.1f} minutes)")
+            logger.info(f"   End time: {step1_end.isoformat()}")
+            
+        except ImportError as ie:
+            logger.error(f"❌ IMPORT ERROR: Could not import scraper module")
+            logger.error(f"   Error: {ie}", exc_info=True)
+            raise
+        except Exception as scraper_err:
+            logger.error(f"❌ STEP 1 FAILED: Scraper execution error")
+            logger.error(f"   Error: {scraper_err}", exc_info=True)
+            raise
         
-        # Step 3: Reload models
-        logger.info("Step 3/3: Reloading models into memory...")
-        load_models()
-        logger.info("✅ Models reloaded")
+        # ==================================================================
+        # STEP 2: RETRAIN ML MODEL
+        # ==================================================================
+        step2_start = datetime.utcnow()
+        logger.info(f"\n🧠 STEP 2/3: Retraining ML model...")
+        logger.info(f"   Start time: {step2_start.isoformat()}")
+        logger.info(f"   Loading scraped data...")
         
-        logger.info(f"{'='*60}")
-        logger.info(f"[{datetime.utcnow()}] ✅ Weekly update successful!")
-        logger.info("="*60)
+        try:
+            # Load data to get stats
+            data_path = DATA_DIR / "magicbricks_all_cities.jsonl"
+            if data_path.exists():
+                with open(data_path, 'r', encoding='utf-8') as f:
+                    data_lines = sum(1 for line in f if line.strip())
+                logger.info(f"   ✓ Data loaded: {data_lines} records in JSONL")
+            
+            logger.info(f"\n   🔨 Training Random Forest model...")
+            logger.info(f"      - 100 estimators, max_depth=20")
+            logger.info(f"      - 80/20 train/test split")
+            logger.info(f"      - Using all CPU cores ({os.cpu_count()} cores available)\n")
+            
+            if run_model_retraining():
+                step2_end = datetime.utcnow()
+                step2_duration = (step2_end - step2_start).total_seconds()
+                
+                logger.info(f"\n✅ STEP 2 COMPLETE: Model retraining successful")
+                logger.info(f"   Duration: {step2_duration:.1f} seconds ({step2_duration/60:.1f} minutes)")
+                logger.info(f"   Models saved to: {MODEL_DIR}")
+                logger.info(f"   End time: {step2_end.isoformat()}")
+            else:
+                logger.warning(f"⚠️  STEP 2 PARTIAL: Model retraining had issues")
+                logger.warning(f"   Continuing with existing models...")
+        except Exception as retrain_err:
+            logger.error(f"❌ STEP 2 FAILED: Model retraining error")
+            logger.error(f"   Error: {retrain_err}", exc_info=True)
+            raise
+        
+        # ==================================================================
+        # STEP 3: RELOAD MODELS INTO MEMORY
+        # ==================================================================
+        step3_start = datetime.utcnow()
+        logger.info(f"\n🔄 STEP 3/3: Reloading models into memory...")
+        logger.info(f"   Start time: {step3_start.isoformat()}")
+        
+        try:
+            logger.info(f"   Loading: price_predictor_rf.pkl...")
+            logger.info(f"   Loading: encoders.pkl...")
+            logger.info(f"   Loading: market data from JSONL...\n")
+            
+            load_models()
+            
+            step3_end = datetime.utcnow()
+            step3_duration = (step3_end - step3_start).total_seconds()
+            
+            logger.info(f"✅ STEP 3 COMPLETE: Models reloaded into memory")
+            logger.info(f"   Duration: {step3_duration:.1f} seconds")
+            logger.info(f"   Data points: {len(market_data) if market_data is not None else 0}")
+            logger.info(f"   End time: {step3_end.isoformat()}")
+        except Exception as load_err:
+            logger.error(f"❌ STEP 3 FAILED: Model reload error")
+            logger.error(f"   Error: {load_err}", exc_info=True)
+            raise
+        
+        # ==================================================================
+        # SUCCESS
+        # ==================================================================
+        end_time = datetime.utcnow()
+        total_duration = (end_time - start_time).total_seconds()
+        
+        logger.info(f"\n{'='*70}")
+        logger.info(f"✅ SUCCESS: Weekly update completed!")
+        logger.info(f"{'='*70}")
+        logger.info(f"\n📈 SUMMARY:")
+        logger.info(f"   Total time: {total_duration:.1f} seconds ({total_duration/60:.1f} minutes)")
+        logger.info(f"   Step 1 (Scraper): {(step1_duration/total_duration*100):.0f}%")
+        logger.info(f"   Step 2 (Training): {(step2_duration/total_duration*100):.0f}%")
+        logger.info(f"   Step 3 (Reload): {(step3_duration/total_duration*100):.0f}%")
+        logger.info(f"   Completed at: {end_time.isoformat()}")
+        logger.info(f"\n   📊 Next update: {(end_time + pd.Timedelta(days=7)).isoformat()}")
+        logger.info(f"{'='*70}\n")
+        
+        return True
         
     except Exception as e:
-        logger.error(f"{'='*60}")
-        logger.error(f"[{datetime.utcnow()}] ❌ Weekly update FAILED: {e}")
-        logger.error("="*60)
+        end_time = datetime.utcnow()
+        total_duration = (end_time - start_time).total_seconds()
+        
+        logger.error(f"\n{'='*70}")
+        logger.error(f"❌ FAILURE: Weekly update FAILED")
+        logger.error(f"{'='*70}")
+        logger.error(f"\n💥 ERROR DETAILS:")
+        logger.error(f"   Failed after: {total_duration:.1f} seconds ({total_duration/60:.1f} minutes)")
+        logger.error(f"   Error message: {str(e)}")
+        logger.error(f"   Failed at: {end_time.isoformat()}")
+        logger.error(f"\n   Stack trace:", exc_info=True)
+        logger.error(f"{'='*70}\n")
+        
+        # Don't raise - let scheduler continue, but log the failure
+        return False
 
 
 # Initialize scheduler
-scheduler = BackgroundScheduler(daemon=True)
+scheduler = BackgroundScheduler(daemon=True, timezone=utc)
 scheduler.add_job(
     scheduled_weekly_update,
     'cron',
-    day_of_week='0',      # Sunday
-    hour='2',              # 2 AM
-    minute='0',            # UTC
-    id='weekly_update'
+    day_of_week='6',      # Sunday (0=Monday, 6=Sunday in APScheduler)
+    hour='2',              # 2 AM UTC
+    minute='0',            # 00 minutes
+    id='scheduled_weekly_update'
 )
 
 @app.on_event("startup")
 def start_scheduler():
-    scheduler.start()
-    logger.info("📅 Background scheduler started - weekly updates at Sunday 2 AM UTC")
+    try:
+        scheduler.start()
+        logger.info("✅ APScheduler STARTED - weekly updates at Sunday 2 AM UTC")
+        logger.info(f"   Jobs scheduled: {[job.id for job in scheduler.get_jobs()]}")
+    except Exception as e:
+        logger.error(f"❌ Failed to start scheduler: {e}", exc_info=True)
 
 
 # ============================================================================
