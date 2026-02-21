@@ -29,7 +29,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --quiet \
-            curl-cffi==0.7.1 \
+            "curl-cffi>=0.8.0" \
             beautifulsoup4==4.12.0 \
             requests==2.31.0
 

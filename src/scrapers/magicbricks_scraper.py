@@ -166,9 +166,17 @@ class MagicBricksInfiniteScraper:
     def _make_session(self):
         """Create a new curl_cffi session with proxy if configured."""
         if CURL_CFFI_AVAILABLE:
-            session = cffi_requests.Session(impersonate=self._profile["impersonate"])
+            try:
+                session = cffi_requests.Session(impersonate=self._profile["impersonate"])
+            except Exception:
+                # curl_cffi version too old for this profile — downgrade to chrome120
+                fallback = next(p for p in CHROME_PROFILES if p["impersonate"] == "chrome120")
+                self._profile = fallback
+                logger.warning("[Session] Profile not supported by installed curl_cffi — downgraded to chrome120")
+                session = cffi_requests.Session(impersonate="chrome120")
         else:
-            session = cffi_requests.Session()
+            import requests as _req
+            session = _req.Session()
         if PROXY_URL:
             session.proxies = {"https": PROXY_URL, "http": PROXY_URL}
         return session
@@ -335,7 +343,21 @@ class MagicBricksInfiniteScraper:
                 return html
 
             except Exception as exc:
-                logger.warning(f"[Page {page_num}] Request error (attempt {attempt}): {exc}")
+                if "not supported" in str(exc).lower():
+                    # Profile too new for installed curl_cffi — hard-downgrade to chrome120
+                    fallback = next(
+                        (p for p in CHROME_PROFILES if p["impersonate"] == "chrome120"),
+                        CHROME_PROFILES[-1],
+                    )
+                    logger.warning(
+                        f"[Page {page_num}] '{self._profile['impersonate']}' unsupported — "
+                        f"downgrading to {fallback['impersonate']}"
+                    )
+                    self._profile = fallback
+                    self.session = self._make_session()
+                    self._warmed_up = False
+                else:
+                    logger.warning(f"[Page {page_num}] Request error (attempt {attempt}): {exc}")
                 time.sleep(random.uniform(8.0, 16.0))
 
         return None
