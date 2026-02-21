@@ -590,7 +590,7 @@ def trigger_scraper_manual(x_api_key: str = Header(None)):
         # Run scraper (with data persisted to /data/raw)
         logger.info("🔍 Starting scraper...")
         try:
-            scrape_infinite_parallel(max_pages=15, enable_details=True, max_workers=2)
+            scrape_infinite_parallel(max_pages=15, enable_details=True, max_workers=1)
             logger.info("✅ Scraper completed successfully")
         except Exception as scraper_err:
             logger.error(f"❌ Scraper failed: {scraper_err}", exc_info=True)
@@ -752,7 +752,7 @@ def scheduled_weekly_update():
             logger.info(f"\n   🚀 Starting scraper...\n")
             
             # Run scraper with detailed output
-            total_scraped = scrape_infinite_parallel(max_pages=15, enable_details=True, max_workers=2)
+            total_scraped = scrape_infinite_parallel(max_pages=15, enable_details=True, max_workers=1)
             
             step1_end = datetime.utcnow()
             step1_duration = (step1_end - step1_start).total_seconds()

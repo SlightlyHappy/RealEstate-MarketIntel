@@ -13,6 +13,8 @@ from pathlib import Path
 import re
 from bs4 import BeautifulSoup
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import time
 import random
 from threading import Lock
@@ -28,30 +30,83 @@ logger = logging.getLogger(__name__)
 # Suppress unicode issues on Windows
 import sys
 if sys.stdout.encoding != 'utf-8':
-    # Reconfigure stdout to use utf-8
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-# User agents to rotate through (avoid detection)
+# Up-to-date user agents (Chrome 124/125, Firefox 125, Edge 124, Safari 17)
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/91.0.864.59",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36",
+    # Chrome on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Chrome on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Chrome on Linux
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    # Firefox
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:126.0) Gecko/20100101 Firefox/126.0",
+    # Edge
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    # Safari on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    # Chrome on Android
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
 ]
 
-# HTTP headers to look more like real browser
-BROWSER_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1"
+# Matching Sec-CH-UA headers per user-agent (Chrome/Edge only — Firefox and Safari omit these)
+SEC_CH_UA_MAP = {
+    "Chrome/125": '"Google Chrome";v="125", "Chromium";v="125", "Not-A.Brand";v="99"',
+    "Chrome/124": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+    "Edg/124":   '"Microsoft Edge";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
 }
+
+
+def _get_headers_for_ua(ua: str, referer: str) -> Dict:
+    """Build a realistic, browser-matched header set for the given User-Agent."""
+    is_mobile = "Mobile" in ua or "Android" in ua
+    is_firefox = "Firefox" in ua
+    is_safari_only = "Safari" in ua and "Chrome" not in ua and "Edg" not in ua
+
+    headers: Dict = {
+        "User-Agent": ua,
+        "Accept-Language": random.choice([
+            "en-IN,en-GB;q=0.9,en;q=0.8",
+            "en-US,en;q=0.9,hi;q=0.7",
+            "en-GB,en;q=0.8",
+        ]),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
+        "Referer": referer,
+    }
+
+    if is_firefox:
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        headers["DNT"] = "1"
+        headers["Sec-Fetch-Dest"] = "document"
+        headers["Sec-Fetch-Mode"] = "navigate"
+        headers["Sec-Fetch-Site"] = "same-origin"
+        headers["Sec-Fetch-User"] = "?1"
+    elif is_safari_only:
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    else:
+        # Chrome / Edge / Chromium Android
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+        headers["Sec-Fetch-Dest"] = "document"
+        headers["Sec-Fetch-Mode"] = "navigate"
+        headers["Sec-Fetch-Site"] = "same-origin"
+        headers["Sec-Fetch-User"] = "?1"
+        headers["sec-ch-ua-mobile"] = "?1" if is_mobile else "?0"
+        headers["sec-ch-ua-platform"] = '"Android"' if is_mobile else random.choice(['"Windows"', '"macOS"', '"Linux"'])
+        # Match Sec-CH-UA to actual version
+        for key, val in SEC_CH_UA_MAP.items():
+            if key in ua:
+                headers["sec-ch-ua"] = val
+                break
+
+    return headers
 
 
 class MagicBricksInfiniteScraper:
@@ -85,17 +140,47 @@ class MagicBricksInfiniteScraper:
         self.properties = []
         self.seen_urls = set()
         self.file_lock = Lock()  # Thread-safe file writing
-        
+        self.session = self._make_session()
+        self._warmed_up = False
+
+    def _make_session(self) -> requests.Session:
+        """Create a persistent session with connection pooling and automatic retries on network errors."""
+        session = requests.Session()
+        # Retry on transient network failures only — NOT on 403/4xx (handled manually)
+        retry = Retry(
+            total=2,
+            backoff_factor=1.5,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def _warm_up(self):
+        """Hit the homepage first so we get cookies and look like a real visitor."""
+        if self._warmed_up:
+            return
+        try:
+            ua = random.choice(USER_AGENTS)
+            headers = _get_headers_for_ua(ua, "https://www.google.com/")
+            headers["Referer"] = "https://www.google.com/search?q=magicbricks+property+sale+india"
+            logger.info("[Session] Warming up — visiting homepage...")
+            r = self.session.get("https://www.magicbricks.com/", headers=headers, timeout=20)
+            if r.status_code == 200:
+                logger.info("[Session] Homepage OK — cookies acquired")
+            else:
+                logger.warning(f"[Session] Homepage returned {r.status_code}")
+            time.sleep(random.uniform(3.0, 6.0))
+            self._warmed_up = True
+        except Exception as e:
+            logger.warning(f"[Session] Warm-up failed (continuing anyway): {e}")
+            self._warmed_up = True  # don't retry warm-up in a loop
+
     def get_random_user_agent(self) -> str:
-        """Get random user agent to avoid detection"""
+        """Get random user agent"""
         return random.choice(USER_AGENTS)
-    
-    def get_request_headers(self) -> Dict:
-        """Get headers for HTTP request to look like real browser"""
-        headers = BROWSER_HEADERS.copy()
-        headers["User-Agent"] = self.get_random_user_agent()
-        headers["Referer"] = self.BASE_URL
-        return headers
         
     def set_city(self, city: str):
         """Set current city for scraping"""
@@ -107,30 +192,80 @@ class MagicBricksInfiniteScraper:
         params = "&".join([f"{k}={v}" for k, v in self.filters.items()])
         return f"{self.BASE_URL}?{params}&page={page}"
     
-    def fetch_page(self, url: str, page_num: int = 1) -> Optional[str]:
-        """Fetch a page using requests with rotation and delays"""
-        try:
-            logger.info(f"[Page {page_num}] Fetching: {url[:80]}...")
-            
-            # Use rotating user agents and headers
-            headers = self.get_request_headers()
-            
-            # Random delay (0.5-2 seconds) to avoid detection
-            delay = random.uniform(0.5, 2.0)
-            time.sleep(delay)
-            
-            response = requests.get(url, headers=headers, timeout=15)
-            
-            if response.status_code == 200:
-                logger.info(f"[Page {page_num}] [SUCCESS] Fetched with {headers['User-Agent'][:40]}...")
-                return response.text
-            else:
-                logger.error(f"[Page {page_num}] Status code: {response.status_code}")
+    def fetch_page(self, url: str, page_num: int = 1, is_detail: bool = False) -> Optional[str]:
+        """Fetch a page with realistic browser behaviour, rotating UA/headers, and
+        exponential backoff on 403s (up to MAX_RETRIES attempts)."""
+
+        MAX_RETRIES = 4
+        BASE_DELAY  = (4.0, 9.0)   # normal inter-request delay range (seconds)
+        BLOCK_DELAY = (15.0, 35.0) # extra pause after a 403 before retrying
+
+        # Warm up session on first real request
+        self._warm_up()
+
+        # Pick a referer that looks organic
+        if is_detail:
+            referer = self.BASE_URL + "?cityName=" + getattr(self, 'current_city', 'Mumbai')
+        else:
+            referer = "https://www.magicbricks.com/"
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                ua = random.choice(USER_AGENTS)
+                headers = _get_headers_for_ua(ua, referer)
+
+                # Organic delay — longer for detail pages, longer on retries
+                delay = random.uniform(*BASE_DELAY)
+                if attempt > 1:
+                    delay += random.uniform(5.0, 10.0) * attempt
+                if is_detail:
+                    delay *= random.uniform(0.8, 1.4)
+                time.sleep(delay)
+
+                logger.info(f"[Page {page_num}] Fetching (attempt {attempt}/{MAX_RETRIES}): {url[:80]}...")
+
+                response = self.session.get(url, headers=headers, timeout=20, allow_redirects=True)
+
+                if response.status_code == 200:
+                    logger.info(f"[Page {page_num}] ✓ 200 OK — {len(response.text):,} chars")
+                    referer = url  # update referer for next hop
+                    return response.text
+
+                elif response.status_code == 403:
+                    backoff = random.uniform(*BLOCK_DELAY) * attempt
+                    logger.warning(f"[Page {page_num}] 403 Forbidden (attempt {attempt}) — backing off {backoff:.0f}s")
+                    if attempt < MAX_RETRIES:
+                        time.sleep(backoff)
+                        # Recreate session on repeated blocks to get fresh cookies
+                        if attempt >= 2:
+                            logger.info(f"[Page {page_num}] Recreating session for fresh cookies...")
+                            self.session = self._make_session()
+                            self._warmed_up = False
+                            self._warm_up()
+                    else:
+                        logger.error(f"[Page {page_num}] Giving up after {MAX_RETRIES} attempts (403)")
+                        return None
+
+                elif response.status_code == 429:
+                    backoff = random.uniform(30.0, 60.0) * attempt
+                    logger.warning(f"[Page {page_num}] 429 Rate Limited — backing off {backoff:.0f}s")
+                    time.sleep(backoff)
+
+                else:
+                    logger.error(f"[Page {page_num}] Unexpected status {response.status_code}")
+                    return None
+
+            except requests.exceptions.Timeout:
+                logger.warning(f"[Page {page_num}] Timeout on attempt {attempt}")
+                time.sleep(random.uniform(5.0, 12.0))
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"[Page {page_num}] Connection error on attempt {attempt}: {e}")
+                time.sleep(random.uniform(8.0, 15.0))
+            except Exception as e:
+                logger.error(f"[Page {page_num}] Unexpected error: {e}")
                 return None
-                
-        except Exception as e:
-            logger.error(f"[Page {page_num}] Error: {str(e)}")
-            return None
+
+        return None
     
     def extract_property_listings(self, html: str, page_num: int = 1) -> List[Dict]:
         """Extract property listing cards from page"""
@@ -353,13 +488,13 @@ def scrape_single_city_task(city: str, max_pages: int = 50, enable_details: bool
         if enable_details:
             for idx, prop in enumerate(city_properties, 1):
                 try:
-                    detail_html = scraper.fetch_page(prop['url'], page_num=idx)
+                    detail_html = scraper.fetch_page(prop['url'], page_num=idx, is_detail=True)
                     if detail_html:
                         detail = scraper.extract_property_detail(detail_html)
                         merged = {**prop, **detail}
                     else:
                         merged = prop
-                        
+
                 except Exception as e:
                     logger.warning(f"[{city}] Error processing property {idx}: {str(e)}")
                     merged = prop
@@ -383,8 +518,12 @@ def scrape_single_city_task(city: str, max_pages: int = 50, enable_details: bool
         return {"city": city, "total": 0}
 
 
-def scrape_infinite_parallel(max_pages: int = 50, enable_details: bool = True, max_workers: int = 3):
-    """Scrape properties in parallel across multiple cities"""
+def scrape_infinite_parallel(max_pages: int = 50, enable_details: bool = True, max_workers: int = 1):
+    """Scrape properties in parallel across multiple cities.
+    max_workers defaults to 1 — running cities sequentially is far less likely
+    to trigger bot detection than hammering from multiple threads simultaneously.
+    Increase to 2 only if you are comfortable with a higher 403 rate.
+    """
     
     script_dir = Path(__file__).parent
     data_dir = script_dir.parent.parent / "data" / "raw"
