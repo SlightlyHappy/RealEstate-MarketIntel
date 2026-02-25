@@ -133,10 +133,10 @@ class MagicBricksInfiniteScraper:
     ]
 
     BASE_FILTERS = {
-        "bedroom": "2,3",
+        "bedroom": ">5,1,2,3,4",  # All bedroom types (>5 = 5+, plus 1,2,3,4 BHK)
         "proptype": (
             "Multistorey-Apartment,Builder-Floor-Apartment,"
-            "Penthouse,Studio-Apartment,Residential-House,Villa"
+            "Penthouse,Studio-Apartment,Residential-House,Villa,Residential-Plot"
         ),
     }
 

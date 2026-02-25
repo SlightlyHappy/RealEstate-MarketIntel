@@ -43,7 +43,7 @@ jobs:
           python src/scrapers/magicbricks_scraper.py \
             --workers 3 \
             --detail-workers 2 \
-            --pages 15
+            --pages 65
           echo "=== Scraper finished ==="
 
       - name: Check output
