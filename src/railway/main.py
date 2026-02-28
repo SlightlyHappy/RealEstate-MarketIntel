@@ -376,15 +376,15 @@ def load_models():
         with open(encoder_path, "rb") as f:
             enc = pickle.load(f)
         if isinstance(enc, tuple):
-            logger.warning("Old encoder tuple format - retrain to unlock all features")
+            logger.warning("Old encoder tuple format - model was trained with 5 features")
             encoder_bundle_g = {
+                "le_location":       enc[0],
                 "le_ptype":          enc[1],
                 "location_means":    {},
                 "city_means":        {},
                 "global_mean_price": 10.0,
                 "major_locations":   [],
-                "feature_cols":      ["bhk", "area_sqft", "location_target", "city_target",
-                                      "ptype_encoded", "days_on_market", "price_change_count"],
+                "feature_cols":      ["bhk", "area_sqft", "location_encoded", "ptype_encoded", "price_per_sqft"],
             }
         else:
             encoder_bundle_g = enc
@@ -449,11 +449,28 @@ def load_models():
 
         mdf["price_velocity"] = mdf.apply(_velocity, axis=1)
 
+        global_mean = float(mdf["price_cr"].mean())
+        
+        # Get or compute location/city means
+        # If encoder_bundle_g has empty dicts (old tuple encoder), compute from data
         location_means = encoder_bundle_g.get("location_means", {})
         city_means     = encoder_bundle_g.get("city_means", {})
-        global_mean    = encoder_bundle_g.get(
-            "global_mean_price", float(mdf["price_cr"].mean()))
         major_locs     = encoder_bundle_g.get("major_locations", [])
+        
+        # If location_means is empty, compute from the cleaned data
+        if not location_means or len(location_means) == 0:
+            logger.info("  ⚠️  location_means empty - computing from data")
+            location_means = mdf.groupby("location")["price_cr"].mean().to_dict()
+        
+        # If city_means is empty, compute from the cleaned data
+        if not city_means or len(city_means) == 0:
+            logger.info("  ⚠️  city_means empty - computing from data")
+            city_means = mdf.groupby("city")["price_cr"].mean().to_dict()
+        
+        # If major_locs is empty, identify from data
+        if not major_locs or len(major_locs) == 0:
+            location_counts = mdf["location"].value_counts()
+            major_locs = location_counts[location_counts >= 20].index.tolist()
 
         mdf["location_grouped"] = mdf["location"].apply(
             lambda x: x if x in major_locs else "Other"
@@ -468,6 +485,15 @@ def load_models():
                 lambda x: x if x in known_ptypes else le_ptype.classes_[0]
             )
             mdf["ptype_encoded"] = le_ptype.transform(mdf["ptype_grouped"])
+        
+        # Also create location_encoded for backward compatibility with old 5-feature model
+        le_location = encoder_bundle_g.get("le_location")
+        if le_location is not None:
+            known_locs = set(le_location.classes_)
+            mdf["location_safe"] = mdf["location"].apply(
+                lambda x: x if x in known_locs else le_location.classes_[0]
+            )
+            mdf["location_encoded"] = le_location.transform(mdf["location_safe"])
 
         mdf["price_per_sqft"] = (mdf["price_cr"] * 10_000_000) / mdf["area_sqft"]
 
@@ -574,26 +600,27 @@ def estimate_price(
         if not (300 <= area_sqft <= 10000):
             raise HTTPException(status_code=400, detail="Area must be 300-10,000 sqft")
         
-        # Resolve target-encoded values from saved training lookup tables
-        location_means = encoder_bundle_g.get("location_means", {})
-        city_means     = encoder_bundle_g.get("city_means", {})
-        global_mean    = encoder_bundle_g.get("global_mean_price", 10.0)
-        major_locs     = encoder_bundle_g.get("major_locations", [])
-
-        loc_grouped     = location if location in major_locs else "Other"
-        location_target = location_means.get(loc_grouped, global_mean)
-        city_target     = city_means.get(city, city_means.get("Unknown", global_mean))
-
+        # Resolve location/property type encodings
+        le_location_enc = encoder_bundle_g.get("le_location")
         le_ptype_enc = encoder_bundle_g.get("le_ptype")
+        
+        # Handle location encoding
+        known_locs = set(le_location_enc.classes_) if le_location_enc else set()
+        loc_safe = location if location in known_locs else (le_location_enc.classes_[0] if le_location_enc else "Other")
+        location_encoded = int(le_location_enc.transform([loc_safe])[0]) if le_location_enc else 0
+        
+        # Handle property type encoding
         try:
-            ptype_encoded = int(le_ptype_enc.transform([property_type])[0])
+            ptype_encoded = int(le_ptype_enc.transform([property_type])[0]) if le_ptype_enc else 0
         except (ValueError, AttributeError):
             ptype_encoded = 0
             property_type = "Apartment"
-
-        # New query: no listing history -> days_on_market=0, price_change_count=0
-        X = np.array([[bhk, area_sqft, location_target, city_target,
-                       ptype_encoded, 0, 0]])
+        
+        # Calculate price_per_sqft
+        price_per_sqft = (1.5 * 10_000_000) / area_sqft if area_sqft > 0 else 0  # Placeholder for estimation
+        
+        # Build features for the old 5-feature model: bhk, area_sqft, location_encoded, ptype_encoded, price_per_sqft
+        X = np.array([[bhk, area_sqft, location_encoded, ptype_encoded, price_per_sqft]])
 
         # Prediction + 95% CI from individual tree spread
         all_tree_preds  = np.array([tree.predict(X)[0] for tree in model_rf.estimators_])
@@ -601,7 +628,7 @@ def estimate_price(
         pred_std        = float(all_tree_preds.std())
         ci_low  = round(max(0.0, predicted_price - 1.96 * pred_std), 2)
         ci_high = round(predicted_price + 1.96 * pred_std, 2)
-        price_per_sqft_est = (predicted_price * 10_000_000) / area_sqft
+        price_per_sqft_est = (predicted_price * 10_000_000) / area_sqft if area_sqft > 0 else 0
 
         return JSONResponse({
             "property": {
