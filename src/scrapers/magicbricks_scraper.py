@@ -534,6 +534,8 @@ def scrape_single_city_task(
                 logger.warning(f"[{city}] Page {page}: fetch failed — stopping city.")
                 break
             listings = scraper.extract_property_listings(html, page_num=page)
+            for listing in listings:
+                listing["city"] = city
             city_props.extend(listings)
             if not listings:
                 logger.info(f"[{city}] Page {page}: no new listings — done.")

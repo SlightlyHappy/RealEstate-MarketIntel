@@ -17,10 +17,10 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import os
 import logging
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_predict
 from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -59,10 +59,16 @@ for d in [DATA_DIR, MODEL_DIR, LOG_DIR]:
 
 # Global state
 model_rf = None
-le_location = None
-le_ptype = None
+encoder_bundle_g = None   # holds le_ptype, location_means, city_means, feature_cols, …
 market_data = None
 last_update_time = None
+model_performance = {
+    "mae_cr":           None,
+    "rmse_cr":          None,
+    "r2":               None,
+    "training_samples": None,
+    "trained_at":       None,
+}
 
 # ============================================================================
 # MODEL LOADING
@@ -98,29 +104,96 @@ def clean_data(df):
 
 
 def feature_engineering(df):
-    """Create features for modeling"""
-    df['price_per_sqft'] = (df['price_cr'] * 10_000_000) / df['area_sqft']
-    
-    # Location grouping
-    location_counts = df['location'].value_counts()
-    major_locations = location_counts[location_counts >= 20].index.tolist()
-    df['location_grouped'] = df['location'].apply(
-        lambda x: x if x in major_locations else 'Other'
+    """Engineer training features — zero target leakage.
+
+    Returns (df_enriched, encoder_bundle) where encoder_bundle holds
+    everything needed to replicate the same transforms at inference time.
+    """
+    # ── Temporal features ──────────────────────────────────────────────────
+    def _days_on_market(row):
+        try:
+            first = row.get("first_seen_at") or row.get("scraped_at", "")
+            last  = row.get("last_seen_at")  or row.get("scraped_at", "")
+            if first and last:
+                d1 = datetime.fromisoformat(str(first)[:19])
+                d2 = datetime.fromisoformat(str(last)[:19])
+                return max(0, (d2 - d1).days)
+        except Exception:
+            pass
+        return 0
+
+    df["days_on_market"] = df.apply(_days_on_market, axis=1)
+
+    ph_col = (
+        df["price_history"] if "price_history" in df.columns
+        else pd.Series([[] for _ in range(len(df))], index=df.index)
     )
-    
-    # Encode categorical variables
-    le_location = LabelEncoder()
+    df["price_change_count"] = ph_col.apply(
+        lambda x: len(x) if isinstance(x, list) else 0
+    )
+
+    def _price_velocity(row):
+        """Monthly % price change vs oldest known price. Capped ±100%."""
+        ph = row.get("price_history")
+        if not isinstance(ph, list) or len(ph) == 0:
+            return 0.0
+        try:
+            oldest = float(ph[0]["price"])
+            if ph[0].get("price_unit") == "Lac":
+                oldest /= 100
+            current = float(row.get("price_cr", 0))
+            if oldest == 0:
+                return 0.0
+            months = max(1, row.get("days_on_market", 0)) / 30.0
+            return round(
+                float(np.clip(((current - oldest) / oldest) * 100 / months, -100, 100)), 2
+            )
+        except Exception:
+            return 0.0
+
+    df["price_velocity"] = df.apply(_price_velocity, axis=1)
+
+    # ── Location grouping ──────────────────────────────────────────────────
+    location_counts = df["location"].value_counts()
+    major_locations = location_counts[location_counts >= 20].index.tolist()
+    df["location_grouped"] = df["location"].apply(
+        lambda x: x if x in major_locations else "Other"
+    )
+
+    # ── City column (older records pre-date the city tag) ─────────────────
+    if "city" not in df.columns:
+        df["city"] = "Unknown"
+    df["city"] = df["city"].fillna("Unknown")
+
+    # ── Target encoding — location/city encoded as mean price_cr ──────────
+    # Computed on the training corpus only; saved for inference lookups.
+    global_mean    = float(df["price_cr"].mean())
+    location_means = df.groupby("location_grouped")["price_cr"].mean().to_dict()
+    city_means     = df.groupby("city")["price_cr"].mean().to_dict()
+
+    df["location_target"] = df["location_grouped"].map(location_means).fillna(global_mean)
+    df["city_target"]     = df["city"].map(city_means).fillna(global_mean)
+
+    # ── Property type label encoder ────────────────────────────────────────
     le_ptype = LabelEncoder()
-    
-    df['location_encoded'] = le_location.fit_transform(df['location_grouped'])
-    df['ptype_encoded'] = le_ptype.fit_transform(df['property_type'])
-    
-    return df, le_location, le_ptype
+    df["ptype_encoded"] = le_ptype.fit_transform(df["property_type"].fillna("Apartment"))
+
+    # ── price_per_sqft — market analytics only, NOT a training feature ─────
+    df["price_per_sqft"] = (df["price_cr"] * 10_000_000) / df["area_sqft"]
+
+    encoder_bundle = {
+        "le_ptype":          le_ptype,
+        "location_means":    location_means,
+        "city_means":        city_means,
+        "global_mean_price": global_mean,
+        "major_locations":   major_locations,
+    }
+    return df, encoder_bundle
 
 
 def run_model_retraining():
     """Full retraining pipeline - called weekly or manually"""
-    global model_rf, le_location, le_ptype, market_data, last_update_time
+    global model_rf, encoder_bundle_g, market_data, last_update_time, model_performance
     
     logger.info("🔄 Starting full model retraining pipeline...")
     
@@ -161,16 +234,24 @@ def run_model_retraining():
         
         # Feature engineering
         logger.info(f"\n  🔧 Feature engineering...")
-        df, le_location, le_ptype = feature_engineering(df)
+        df, encoder_bundle = feature_engineering(df)
         logger.info(f"     ✓ Identified {df['location_grouped'].nunique()} major locations")
         logger.info(f"     ✓ Property types: {df['ptype_encoded'].nunique()}")
         
         # Prepare training data
         logger.info(f"\n  📊 Preparing training data...")
-        feature_cols = ['bhk', 'area_sqft', 'location_encoded', 'ptype_encoded', 'price_per_sqft']
-        X = df[feature_cols].values
-        y = df['price_cr'].values
-        logger.info(f"     ✓ Features: {feature_cols}")
+        FEATURE_COLS = [
+            "bhk",
+            "area_sqft",
+            "location_target",      # target-encoded: mean price_cr per neighbourhood
+            "city_target",          # target-encoded: mean price_cr per city
+            "ptype_encoded",
+            "days_on_market",       # demand proxy
+            "price_change_count",   # price volatility signal
+        ]
+        X = df[FEATURE_COLS].values
+        y = df["price_cr"].values
+        logger.info(f"     ✓ Features: {FEATURE_COLS}")
         logger.info(f"     ✓ Samples: {len(X)}")
         
         X_train, X_test, y_train, y_test = train_test_split(
@@ -182,15 +263,40 @@ def run_model_retraining():
         # Train Random Forest
         logger.info(f"\n  🧠 Training Random Forest model...")
         logger.info(f"     Configuration: 100 trees, max_depth=20")
-        model_rf = RandomForestRegressor(n_estimators=100, max_depth=20, random_state=42, n_jobs=-1)
+        model_rf = RandomForestRegressor(
+            n_estimators=200,
+            max_depth=None,
+            min_samples_leaf=3,
+            max_features="sqrt",
+            random_state=42,
+            n_jobs=-1,
+        )
         model_rf.fit(X_train, y_train)
         logger.info(f"     ✓ Training completed")
         
         # Evaluate
         logger.info(f"\n  📈 Evaluating model performance...")
         y_pred = model_rf.predict(X_test)
-        mae = mean_absolute_error(y_test, y_pred)
-        r2 = r2_score(y_test, y_pred)
+        mae    = float(mean_absolute_error(y_test, y_pred))
+        rmse   = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+        r2     = float(r2_score(y_test, y_pred))
+
+        # Out-of-fold predictions for the deal finder
+        oof_rf = RandomForestRegressor(
+            n_estimators=200, max_depth=None, min_samples_leaf=3,
+            max_features="sqrt", random_state=42, n_jobs=-1,
+        )
+        oof_preds = cross_val_predict(oof_rf, X, y, cv=5)
+        df["oof_predicted_price"] = oof_preds
+
+        # Update live performance tracker
+        model_performance.update({
+            "mae_cr":           round(mae, 4),
+            "rmse_cr":          round(rmse, 4),
+            "r2":               round(r2, 4),
+            "training_samples": int(len(X_train)),
+            "trained_at":       datetime.utcnow().isoformat(),
+        })
         
         logger.info(f"     ✓ Mean Absolute Error: {mae:.4f} Crores")
         logger.info(f"     ✓ R² Score: {r2:.4f} ({r2*100:.2f}% variance explained)")
@@ -205,12 +311,14 @@ def run_model_retraining():
             pickle.dump(model_rf, f)
         logger.info(f"     ✓ Saved: {model_path}")
         
-        with open(encoder_path, 'wb') as f:
-            pickle.dump((le_location, le_ptype), f)
+        encoder_bundle["feature_cols"] = FEATURE_COLS
+        with open(encoder_path, "wb") as f:
+            pickle.dump(encoder_bundle, f)
         logger.info(f"     ✓ Saved: {encoder_path}")
         
         # Update global state
-        market_data = df
+        encoder_bundle_g = encoder_bundle
+        market_data      = df
         last_update_time = datetime.utcnow()
         
         logger.info(f"\n✅ Model retraining pipeline completed successfully")
@@ -256,66 +364,127 @@ def initialize_persistent_volume():
 
 
 def load_models():
-    """Load ML models from disk"""
-    global model_rf, le_location, le_ptype, market_data, last_update_time
-    
+    """Load ML models and fully prepare market data for API use."""
+    global model_rf, encoder_bundle_g, market_data, last_update_time, model_performance
+
     try:
-        # Load Random Forest model
         model_path = MODEL_DIR / "price_predictor_rf.pkl"
         with open(model_path, "rb") as f:
             model_rf = pickle.load(f)
-        
-        # Load encoders
+
         encoder_path = MODEL_DIR / "encoders.pkl"
         with open(encoder_path, "rb") as f:
-            le_location, le_ptype = pickle.load(f)
-        
-        # Load market data
+            enc = pickle.load(f)
+        if isinstance(enc, tuple):
+            logger.warning("Old encoder tuple format - retrain to unlock all features")
+            encoder_bundle_g = {
+                "le_ptype":          enc[1],
+                "location_means":    {},
+                "city_means":        {},
+                "global_mean_price": 10.0,
+                "major_locations":   [],
+                "feature_cols":      ["bhk", "area_sqft", "location_target", "city_target",
+                                      "ptype_encoded", "days_on_market", "price_change_count"],
+            }
+        else:
+            encoder_bundle_g = enc
+
         data_path = DATA_DIR / "magicbricks_all_cities.jsonl"
-        market_data = pd.read_json(data_path, lines=True)
-        
-        # Normalize prices
-        def to_crore(row):
-            price = float(row['price'])
-            return price / 100 if row['price_unit'] == 'Lac' else price
-        
-        market_data['price_cr'] = market_data.apply(to_crore, axis=1)
-        market_data['bhk'] = pd.to_numeric(market_data['bhk'], errors='coerce')
-        market_data['area_sqft'] = pd.to_numeric(market_data['area_sqft'], errors='coerce')
+        records = []
+        with open(data_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        mdf = pd.DataFrame(records)
+        mdf = normalize_prices(mdf)
+        mdf = clean_data(mdf)
 
-        # Apply the same cleaning filters used during training
-        market_data = market_data[(market_data['bhk'] >= 1) & (market_data['bhk'] <= 5)].copy()
-        market_data = market_data[(market_data['area_sqft'] >= 300) & (market_data['area_sqft'] <= 10000)].copy()
-        market_data = market_data[(market_data['price_cr'] >= 0.3) & (market_data['price_cr'] <= 50)].copy()
-        market_data = market_data.dropna(subset=['bhk', 'area_sqft', 'price_cr', 'location'])
+        if "city" not in mdf.columns:
+            mdf["city"] = "Unknown"
+        mdf["city"] = mdf["city"].fillna("Unknown")
 
-        market_data['price_per_sqft'] = (market_data['price_cr'] * 10_000_000) / market_data['area_sqft']
-        
-        # Group rare/unseen locations to 'Other' (same logic as during training)
-        known_locations = set(le_location.classes_)
-        market_data['location_grouped'] = market_data['location'].apply(
-            lambda x: x if x in known_locations else 'Other'
+        def _dom(row):
+            try:
+                first = row.get("first_seen_at") or row.get("scraped_at", "")
+                last  = row.get("last_seen_at")  or row.get("scraped_at", "")
+                if first and last:
+                    return max(0, (
+                        datetime.fromisoformat(str(last)[:19]) -
+                        datetime.fromisoformat(str(first)[:19])
+                    ).days)
+            except Exception:
+                pass
+            return 0
+
+        mdf["days_on_market"] = mdf.apply(_dom, axis=1)
+
+        ph_col = (
+            mdf["price_history"] if "price_history" in mdf.columns
+            else pd.Series([[] for _ in range(len(mdf))], index=mdf.index)
         )
-        # Map unseen property types to the most common known type
-        known_ptypes = set(le_ptype.classes_)
-        market_data['ptype_grouped'] = market_data['property_type'].apply(
-            lambda x: x if x in known_ptypes else le_ptype.classes_[0]
+        mdf["price_change_count"] = ph_col.apply(
+            lambda x: len(x) if isinstance(x, list) else 0
         )
 
-        # Encode locations
-        market_data['location_encoded'] = le_location.transform(market_data['location_grouped'])
-        market_data['ptype_encoded'] = le_ptype.transform(market_data['ptype_grouped'])
-        
+        def _velocity(row):
+            ph = row.get("price_history")
+            if not isinstance(ph, list) or len(ph) == 0:
+                return 0.0
+            try:
+                oldest = float(ph[0]["price"])
+                if ph[0].get("price_unit") == "Lac":
+                    oldest /= 100
+                current = float(row.get("price_cr", 0))
+                if oldest == 0:
+                    return 0.0
+                months = max(1, row.get("days_on_market", 0)) / 30.0
+                return round(
+                    float(np.clip(((current - oldest) / oldest) * 100 / months, -100, 100)), 2
+                )
+            except Exception:
+                return 0.0
+
+        mdf["price_velocity"] = mdf.apply(_velocity, axis=1)
+
+        location_means = encoder_bundle_g.get("location_means", {})
+        city_means     = encoder_bundle_g.get("city_means", {})
+        global_mean    = encoder_bundle_g.get(
+            "global_mean_price", float(mdf["price_cr"].mean()))
+        major_locs     = encoder_bundle_g.get("major_locations", [])
+
+        mdf["location_grouped"] = mdf["location"].apply(
+            lambda x: x if x in major_locs else "Other"
+        )
+        mdf["location_target"] = mdf["location_grouped"].map(location_means).fillna(global_mean)
+        mdf["city_target"]     = mdf["city"].map(city_means).fillna(global_mean)
+
+        le_ptype = encoder_bundle_g.get("le_ptype")
+        if le_ptype is not None:
+            known_ptypes = set(le_ptype.classes_)
+            mdf["ptype_grouped"] = mdf["property_type"].fillna("Apartment").apply(
+                lambda x: x if x in known_ptypes else le_ptype.classes_[0]
+            )
+            mdf["ptype_encoded"] = le_ptype.transform(mdf["ptype_grouped"])
+
+        mdf["price_per_sqft"] = (mdf["price_cr"] * 10_000_000) / mdf["area_sqft"]
+
+        if "is_stale" in mdf.columns:
+            market_data = mdf[~mdf["is_stale"].fillna(False)].copy()
+        else:
+            market_data = mdf.copy()
+
         last_update_time = datetime.fromtimestamp(data_path.stat().st_mtime)
-        
-        logger.info(f"✅ Models loaded: {len(market_data)} properties")
+        logger.info(f"Models loaded: {len(market_data)} active properties")
         return True
-        
+
     except FileNotFoundError as e:
-        logger.error(f"❌ Model files not found: {e}")
+        logger.error(f"Model files not found: {e}")
         return False
     except Exception as e:
-        logger.error(f"❌ Failed to load models: {e}")
+        logger.error(f"Failed to load models: {e}", exc_info=True)
         return False
 
 
@@ -352,11 +521,12 @@ async def startup():
 @app.get("/health", tags=["System"])
 def health_check():
     """Health check endpoint"""
+    r2 = model_performance.get("r2")
     return {
-        "status": "OK" if model_rf is not None else "LOADING",
-        "timestamp": datetime.utcnow().isoformat(),
+        "status":      "OK" if model_rf is not None else "LOADING",
+        "timestamp":   datetime.utcnow().isoformat(),
         "data_points": len(market_data) if market_data is not None else 0,
-        "model": "Random Forest (94.6% accuracy)"
+        "model":       f"Random Forest | R² {r2:.4f}" if r2 else "Random Forest (pending retrain)",
     }
 
 
@@ -365,14 +535,15 @@ def api_status():
     """API status and data freshness"""
     if model_rf is None:
         raise HTTPException(status_code=503, detail="Models not loaded")
-    
+
     return {
-        "status": "ACTIVE",
+        "status":             "ACTIVE",
         "properties_indexed": len(market_data),
-        "locations": int(market_data['location'].nunique()),
-        "last_updated": last_update_time.isoformat() if last_update_time else None,
-        "model_accuracy": 0.946,
-        "api_version": "1.0.0"
+        "cities":             int(market_data["city"].nunique()) if "city" in market_data.columns else None,
+        "locations":          int(market_data["location"].nunique()),
+        "last_updated":       last_update_time.isoformat() if last_update_time else None,
+        "model_performance":  model_performance,
+        "api_version":        "1.0.0",
     }
 
 
@@ -385,7 +556,8 @@ def estimate_price(
     bhk: int,
     area_sqft: int,
     location: str = "Mumbai",
-    property_type: str = "Apartment"
+    property_type: str = "Apartment",
+    city: str = "Unknown",
 ):
     """
     Estimate fair market price for a property
@@ -402,46 +574,56 @@ def estimate_price(
         if not (300 <= area_sqft <= 10000):
             raise HTTPException(status_code=400, detail="Area must be 300-10,000 sqft")
         
-        # Encode categorical features
+        # Resolve target-encoded values from saved training lookup tables
+        location_means = encoder_bundle_g.get("location_means", {})
+        city_means     = encoder_bundle_g.get("city_means", {})
+        global_mean    = encoder_bundle_g.get("global_mean_price", 10.0)
+        major_locs     = encoder_bundle_g.get("major_locations", [])
+
+        loc_grouped     = location if location in major_locs else "Other"
+        location_target = location_means.get(loc_grouped, global_mean)
+        city_target     = city_means.get(city, city_means.get("Unknown", global_mean))
+
+        le_ptype_enc = encoder_bundle_g.get("le_ptype")
         try:
-            loc_encoded = le_location.transform([location])[0]
-        except ValueError:
-            loc_encoded = le_location.transform(["Other"])[0]
-            location = "Other"
-        
-        try:
-            ptype_encoded = le_ptype.transform([property_type])[0]
-        except ValueError:
-            ptype_encoded = le_ptype.transform(["Apartment"])[0]
+            ptype_encoded = int(le_ptype_enc.transform([property_type])[0])
+        except (ValueError, AttributeError):
+            ptype_encoded = 0
             property_type = "Apartment"
-        
-        # Get location-specific average price per sqft
-        loc_data = market_data[market_data['location'].str.contains(location, case=False, na=False)]
-        avg_price_per_sqft = loc_data['price_per_sqft'].mean() if len(loc_data) > 0 else market_data['price_per_sqft'].mean()
-        
-        # Predict
-        X = np.array([[bhk, area_sqft, loc_encoded, ptype_encoded, avg_price_per_sqft]])
-        predicted_price = model_rf.predict(X)[0]
-        estimated_price_per_sqft = (predicted_price * 10_000_000) / area_sqft
-        
+
+        # New query: no listing history -> days_on_market=0, price_change_count=0
+        X = np.array([[bhk, area_sqft, location_target, city_target,
+                       ptype_encoded, 0, 0]])
+
+        # Prediction + 95% CI from individual tree spread
+        all_tree_preds  = np.array([tree.predict(X)[0] for tree in model_rf.estimators_])
+        predicted_price = float(all_tree_preds.mean())
+        pred_std        = float(all_tree_preds.std())
+        ci_low  = round(max(0.0, predicted_price - 1.96 * pred_std), 2)
+        ci_high = round(predicted_price + 1.96 * pred_std, 2)
+        price_per_sqft_est = (predicted_price * 10_000_000) / area_sqft
+
         return JSONResponse({
             "property": {
-                "bhk": int(bhk),
-                "area_sqft": int(area_sqft),
-                "location": location,
-                "property_type": property_type
+                "bhk":           int(bhk),
+                "area_sqft":     int(area_sqft),
+                "location":      location,
+                "city":          city,
+                "property_type": property_type,
             },
             "estimate": {
-                "price_cr": round(predicted_price, 2),
-                "price_lakhs": round(predicted_price * 100, 1),
-                "price_per_sqft": round(estimated_price_per_sqft, 0)
+                "price_cr":       round(predicted_price, 2),
+                "price_lakhs":    round(predicted_price * 100, 1),
+                "price_per_sqft": round(price_per_sqft_est, 0),
+                "range_cr":       {"low": ci_low, "high": ci_high},
             },
             "confidence": {
-                "accuracy": 0.946,
-                "model": "Random Forest",
-                "note": "±5-15% variance expected"
+                "r2":     model_performance.get("r2"),
+                "mae_cr": model_performance.get("mae_cr"),
+                "model":  "Random Forest (200 trees)",
+                "note":   f"95% CI: {ci_low} - {ci_high} Cr",
             },
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat(),
         }, status_code=200)
         
     except HTTPException:
@@ -465,23 +647,28 @@ def market_heatmap():
     for location in sorted(market_data['location_grouped'].unique()):
         loc_data = market_data[market_data['location_grouped'] == location]
         
-        # Determine market heat
-        if len(loc_data) > 100:
-            status = "🔥 HOT"
-        elif len(loc_data) > 50:
-            status = "🌤️ WARM"
+        # Determine market heat from price velocity (monthly % change trend)
+        velocity = float(loc_data["price_velocity"].mean()) if "price_velocity" in loc_data.columns else 0.0
+        if velocity > 2:
+            status = "RISING"
+        elif velocity < -2:
+            status = "COOLING"
+        elif len(loc_data) >= 30:
+            status = "STABLE"
         else:
-            status = "❄️ COOL"
-        
+            status = "LOW ACTIVITY"
+
         heatmap.append({
-            "location": location,
-            "avg_price_cr": round(loc_data['price_cr'].mean(), 2),
-            "median_price_cr": round(loc_data['price_cr'].median(), 2),
-            "avg_price_per_sqft": round(loc_data['price_per_sqft'].mean(), 0),
-            "min_price_cr": round(loc_data['price_cr'].min(), 2),
-            "max_price_cr": round(loc_data['price_cr'].max(), 2),
-            "properties_count": len(loc_data),
-            "market_status": status
+            "location":                   location,
+            "avg_price_cr":               round(loc_data["price_cr"].mean(), 2),
+            "median_price_cr":            round(loc_data["price_cr"].median(), 2),
+            "avg_price_per_sqft":         round(loc_data["price_per_sqft"].mean(), 0),
+            "min_price_cr":               round(loc_data["price_cr"].min(), 2),
+            "max_price_cr":               round(loc_data["price_cr"].max(), 2),
+            "properties_count":           len(loc_data),
+            "avg_days_on_market":         round(float(loc_data["days_on_market"].mean()), 1) if "days_on_market" in loc_data.columns else None,
+            "price_velocity_pct_monthly": round(velocity, 2),
+            "market_status":              status,
         })
     
     # Sort by price per sqft (most expensive first)
@@ -502,44 +689,58 @@ def deals_this_week(min_discount: int = 15):
         raise HTTPException(status_code=503, detail="Models loading")
     
     try:
-        # Prepare features
-        X_all = market_data[['bhk', 'area_sqft', 'location_encoded', 'ptype_encoded', 'price_per_sqft']].values
-        
-        # Get predictions
-        predicted_prices = model_rf.predict(X_all)
         market_data_copy = market_data.copy()
-        market_data_copy['predicted_price'] = predicted_prices
-        
-        # Calculate deviation
-        market_data_copy['discount_pct'] = (
-            (market_data_copy['price_cr'] - market_data_copy['predicted_price']) / 
-            market_data_copy['predicted_price'] * 100
+
+        # Use OOF predictions where available (honest: model never saw these
+        # properties during their prediction fold). Fall back if absent.
+        if "oof_predicted_price" in market_data_copy.columns:
+            market_data_copy["predicted_price"] = market_data_copy["oof_predicted_price"]
+            prediction_method = "OOF cross-validated"
+        else:
+            feat_cols = encoder_bundle_g.get("feature_cols", []) if encoder_bundle_g else []
+            available = [c for c in feat_cols if c in market_data_copy.columns]
+            if not available:
+                return JSONResponse({"deals": [], "error": "Feature columns unavailable - retrain model"})
+            market_data_copy["predicted_price"] = model_rf.predict(market_data_copy[available].values)
+            prediction_method = "in-sample (retrain for honest OOF)"
+
+        # Calculate discount vs fair value
+        market_data_copy["discount_pct"] = (
+            (market_data_copy["price_cr"] - market_data_copy["predicted_price"]) /
+            market_data_copy["predicted_price"] * 100
         )
-        
-        # Find best deals (underpriced: listed price is BELOW fair value by min_discount%)
-        deals = market_data_copy[market_data_copy['discount_pct'] < -min_discount].nlargest(20, 'area_sqft')
-        
+        market_data_copy["savings_cr"] = (
+            market_data_copy["predicted_price"] - market_data_copy["price_cr"]
+        )
+
+        deals = market_data_copy[market_data_copy["discount_pct"] < -min_discount].nlargest(20, "savings_cr")
+
         deal_list = []
         for _, row in deals.iterrows():
             try:
                 deal_list.append({
-                    "location": row['location'],
-                    "bhk": int(row['bhk']),
-                    "area_sqft": int(row['area_sqft']),
-                    "listed_price_cr": round(row['price_cr'], 2),
-                    "fair_value_cr": round(row['predicted_price'], 2),
-                    "savings_cr": round(row['predicted_price'] - row['price_cr'], 2),
-                    "discount_pct": round(abs(row['discount_pct']), 1),
-                    "property_type": row['property_type']
+                    "location":        row["location"],
+                    "city":            row.get("city", "Unknown"),
+                    "bhk":             int(row["bhk"]),
+                    "area_sqft":       int(row["area_sqft"]),
+                    "listed_price_cr": round(row["price_cr"], 2),
+                    "fair_value_cr":   round(row["predicted_price"], 2),
+                    "savings_cr":      round(row["savings_cr"], 2),
+                    "discount_pct":    round(abs(row["discount_pct"]), 1),
+                    "property_type":   row["property_type"],
+                    "days_on_market":  int(row.get("days_on_market", 0)),
+                    "price_velocity":  float(row.get("price_velocity", 0.0)),
+                    "url":             str(row.get("url", "")),
                 })
-            except:
+            except Exception:
                 pass
-        
+
         return JSONResponse({
-            "deals": deal_list,
-            "count": len(deal_list),
+            "deals":                  deal_list,
+            "count":                  len(deal_list),
             "min_discount_threshold": min_discount,
-            "timestamp": datetime.utcnow().isoformat()
+            "prediction_method":      prediction_method,
+            "timestamp":              datetime.utcnow().isoformat(),
         })
         
     except Exception as e:
@@ -565,10 +766,12 @@ def market_insights():
             }
         },
         "model": {
-            "accuracy_r2": 0.946,
-            "mae_cr": 0.09,
-            "type": "Random Forest (100 trees)",
-            "training_samples": 1000
+            "r2":               model_performance.get("r2"),
+            "mae_cr":           model_performance.get("mae_cr"),
+            "rmse_cr":          model_performance.get("rmse_cr"),
+            "type":             "Random Forest (200 trees)",
+            "training_samples": model_performance.get("training_samples"),
+            "trained_at":       model_performance.get("trained_at"),
         },
         "data": {
             "last_updated": last_update_time.isoformat() if last_update_time else None,
