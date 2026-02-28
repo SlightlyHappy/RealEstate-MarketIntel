@@ -14,7 +14,7 @@ import numpy as np
 import json
 import shutil
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import logging
 from sklearn.model_selection import train_test_split
@@ -134,9 +134,21 @@ def run_model_retraining():
             for line in f:
                 if line.strip():
                     records.append(json.loads(line))
-        
+
+        total_records = len(records)
+        # Train only on active (non-stale) listings — stale records are kept in
+        # the master file for historical/trend queries but excluded from the
+        # price predictor so it reflects the current market.
+        active_records = [r for r in records if not r.get("is_stale", False)]
+        stale_count = total_records - len(active_records)
+        logger.info(
+            f"     ✓ Loaded {total_records} total properties "
+            f"({len(active_records)} active, {stale_count} stale/historical — training on active only)"
+        )
+        records = active_records
+
         df = pd.DataFrame(records)
-        logger.info(f"     ✓ Loaded {len(df)} total properties")
+        logger.info(f"     ✓ Training dataset: {len(df)} properties")
         
         # Clean data
         logger.info(f"\n  🧹 Normalizing prices and cleaning data...")
@@ -570,6 +582,99 @@ def market_insights():
 # HELPERS
 # ============================================================================
 
+def _merge_ingest(existing_path: Path, new_records: list) -> tuple:
+    """
+    URL-keyed smart merge of incoming scraped records into the master dataset.
+
+    Rules:
+      - URL match + price changed  → update record, push old price into price_history
+      - URL match + price same     → refresh last_seen_at, clear stale flag
+      - URL not in master          → insert as new record
+      - In master but not in batch → mark is_stale = True
+      - first_seen_at older than 1 year → delete entirely
+    """
+    now = datetime.utcnow().isoformat()
+    one_year_ago = (datetime.utcnow() - timedelta(days=365)).isoformat()
+
+    # Load existing master keyed by URL
+    master: dict = {}
+    if existing_path.exists():
+        with open(existing_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rec = json.loads(line)
+                        url = rec.get("url")
+                        if url:
+                            master[url] = rec
+                    except json.JSONDecodeError:
+                        continue
+
+    incoming_urls: set = set()
+    stats = {"new": 0, "updated": 0, "unchanged": 0, "stale": 0, "expired": 0}
+
+    for rec in new_records:
+        url = rec.get("url")
+        if not url:
+            continue
+        incoming_urls.add(url)
+
+        if url in master:
+            existing = master[url]
+            price_changed = (
+                str(rec.get("price", "")) != str(existing.get("price", ""))
+                or str(rec.get("price_unit", "")) != str(existing.get("price_unit", ""))
+            )
+            if price_changed:
+                # Record old price in history before overwriting
+                history = existing.get("price_history", [])
+                if existing.get("price"):
+                    history.append({
+                        "price": existing["price"],
+                        "price_unit": existing.get("price_unit", ""),
+                        "recorded_at": existing.get("scraped_at", existing.get("first_seen_at", now)),
+                    })
+                rec["price_history"] = history
+                rec["first_seen_at"] = existing.get("first_seen_at", existing.get("scraped_at", now))
+                rec["last_seen_at"] = now
+                rec["is_stale"] = False
+                master[url] = rec
+                stats["updated"] += 1
+            else:
+                # No price change — just refresh presence metadata
+                existing["last_seen_at"] = now
+                existing["is_stale"] = False
+                master[url] = existing
+                stats["unchanged"] += 1
+        else:
+            # Brand-new listing
+            rec["first_seen_at"] = now
+            rec["last_seen_at"] = now
+            rec["is_stale"] = False
+            rec["price_history"] = []
+            master[url] = rec
+            stats["new"] += 1
+
+    # Flag stale and expire records older than 1 year
+    urls_to_delete = []
+    for url, rec in master.items():
+        if url not in incoming_urls:
+            rec["is_stale"] = True
+            stats["stale"] += 1
+        age_ref = rec.get("first_seen_at") or rec.get("scraped_at", now)
+        if age_ref < one_year_ago:
+            urls_to_delete.append(url)
+            stats["expired"] += 1
+
+    for url in urls_to_delete:
+        del master[url]
+        # If it was counted as stale above, don't double-count
+        stats["stale"] = max(0, stats["stale"] - 1)
+
+    return master, stats
+
+
 def _retrain_and_reload():
     """Background task: retrain ML model then hot-reload it into memory."""
     logger.info("🔁 Background retrain triggered by /admin/ingest")
@@ -601,17 +706,43 @@ async def ingest_scraped_data(
         body = await request.body()
         if not body:
             raise HTTPException(status_code=400, detail="Empty body")
-        line_count = body.count(b'\n')
-        logger.info(f"📥 /admin/ingest: {len(body):,} bytes  ~{line_count} properties")
+
+        # Parse incoming JSONL
+        new_records = []
+        for line in body.decode("utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    new_records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+        logger.info(f"📥 /admin/ingest: {len(new_records)} incoming properties")
+
         out_path = DATA_DIR / "magicbricks_all_cities.jsonl"
-        with open(out_path, "wb") as f:
-            f.write(body)
-        logger.info(f"   ✓ Written to {out_path}")
+
+        # Smart URL-keyed merge (upsert + stale flagging + 1-year expiry)
+        master, stats = _merge_ingest(out_path, new_records)
+
+        # Write merged master back to disk
+        with open(out_path, "w", encoding="utf-8") as f:
+            for rec in master.values():
+                json.dump(rec, f, ensure_ascii=False)
+                f.write("\n")
+
+        logger.info(
+            f"✅ Ingest merged — new: {stats['new']}, updated: {stats['updated']}, "
+            f"unchanged: {stats['unchanged']}, stale: {stats['stale']}, "
+            f"expired: {stats['expired']}, master total: {len(master)}"
+        )
+
         background_tasks.add_task(_retrain_and_reload)
         return {
             "status": "accepted",
-            "properties_received": line_count,
-            "message": "Data written; model retraining queued in background",
+            "incoming": len(new_records),
+            "stats": stats,
+            "total_in_master": len(master),
+            "message": "Data merged; model retraining queued in background",
             "timestamp": datetime.utcnow().isoformat(),
         }
     except HTTPException:
