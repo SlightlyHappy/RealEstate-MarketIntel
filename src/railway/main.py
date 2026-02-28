@@ -240,15 +240,28 @@ def run_model_retraining():
         
         # Prepare training data
         logger.info(f"\n  📊 Preparing training data...")
+        # Use the 5-feature set that matches the old model
         FEATURE_COLS = [
             "bhk",
             "area_sqft",
-            "location_target",      # target-encoded: mean price_cr per neighbourhood
-            "city_target",          # target-encoded: mean price_cr per city
+            "location_encoded",    # LabelEncoder, not target-encoded
             "ptype_encoded",
-            "days_on_market",       # demand proxy
-            "price_change_count",   # price volatility signal
+            "price_per_sqft",
         ]
+        
+        # Create location_encoded using LabelEncoder (for saving)
+        le_location = LabelEncoder()
+        location_counts = df["location_grouped"].value_counts()
+        major_locations = location_counts[location_counts >= 20].index.tolist()
+        df["location_grouped"] = df["location"].apply(
+            lambda x: x if x in major_locations else "Other"
+        )
+        df["location_encoded"] = le_location.fit_transform(df["location_grouped"])
+        
+        # Make sure we have price_per_sqft
+        if "price_per_sqft" not in df.columns:
+            df["price_per_sqft"] = (df["price_cr"] * 10_000_000) / df["area_sqft"]
+        
         X = df[FEATURE_COLS].values
         y = df["price_cr"].values
         logger.info(f"     ✓ Features: {FEATURE_COLS}")
@@ -311,9 +324,19 @@ def run_model_retraining():
             pickle.dump(model_rf, f)
         logger.info(f"     ✓ Saved: {model_path}")
         
-        encoder_bundle["feature_cols"] = FEATURE_COLS
+        # Save as dict with le_location and le_ptype (needed for inference)
+        encoder_dict = {
+            "le_location": le_location,
+            "le_ptype": encoder_bundle.get("le_ptype"),
+            "location_means": encoder_bundle.get("location_means", {}),
+            "city_means": encoder_bundle.get("city_means", {}),
+            "global_mean_price": encoder_bundle.get("global_mean_price", float(df["price_cr"].mean())),
+            "major_locations": major_locations,
+            "feature_cols": FEATURE_COLS,
+        }
+        
         with open(encoder_path, "wb") as f:
-            pickle.dump(encoder_bundle, f)
+            pickle.dump(encoder_dict, f)
         logger.info(f"     ✓ Saved: {encoder_path}")
         
         # Update global state
