@@ -752,7 +752,44 @@ def deals_this_week(min_discount: int = 15):
             market_data_copy["predicted_price"] - market_data_copy["price_cr"]
         )
 
-        deals = market_data_copy[market_data_copy["discount_pct"] < -min_discount].nlargest(20, "savings_cr")
+        # --- Sanity filters to remove false deals caused by data quality issues ---
+        # Problem 1: Outer-suburb properties labeled as city (e.g. Virar/Mira Road
+        # labeled "Mumbai") have legitimately low price/sqft but the model predicts
+        # the city average, making them appear 80%+ underpriced.
+        # Problem 2: Rare/large property types where the model has no training data
+        # extrapolate poorly, inflating fair-value estimates.
+        #
+        # Fix: A valid deal must have price/sqft >= 35% of its location's median
+        # price/sqft (same market segment), AND the discount cannot exceed 45%
+        # (real estate doesn't have genuine 80% discounts on open listings).
+
+        market_data_copy["price_per_sqft"] = (
+            market_data_copy["price_cr"] * 1e7 / market_data_copy["area_sqft"].replace(0, float("nan"))
+        )
+        # Compute median price/sqft per location_grouped (in-dataset reference)
+        loc_median_psqft = (
+            market_data_copy.groupby("location_grouped")["price_per_sqft"].median().to_dict()
+            if "location_grouped" in market_data_copy.columns
+            else {}
+        )
+        if loc_median_psqft:
+            market_data_copy["_loc_median_psqft"] = (
+                market_data_copy["location_grouped"].map(loc_median_psqft)
+            )
+            # Keep only properties where listed price/sqft >= 35% of location median
+            # (filters out different-tier sub-markets mislabeled under a city name)
+            psqft_ok = (
+                market_data_copy["price_per_sqft"] >= market_data_copy["_loc_median_psqft"] * 0.35
+            )
+            market_data_copy = market_data_copy[psqft_ok]
+
+        # Cap: no more than 45% discount (extreme values = model extrapolation error)
+        MAX_DISCOUNT = 45
+        candidate_mask = (
+            (market_data_copy["discount_pct"] < -min_discount) &
+            (market_data_copy["discount_pct"] >= -MAX_DISCOUNT)
+        )
+        deals = market_data_copy[candidate_mask].nlargest(20, "savings_cr")
 
         deal_list = []
         for _, row in deals.iterrows():
