@@ -240,27 +240,16 @@ def run_model_retraining():
         
         # Prepare training data
         logger.info(f"\n  📊 Preparing training data...")
-        # Use the 5-feature set that matches the old model
+        # Use the 7-feature set for richer analysis
         FEATURE_COLS = [
             "bhk",
             "area_sqft",
-            "location_encoded",    # LabelEncoder, not target-encoded
+            "location_target",      # target-encoded: mean price_cr per neighbourhood
+            "city_target",          # target-encoded: mean price_cr per city
             "ptype_encoded",
-            "price_per_sqft",
+            "days_on_market",       # demand proxy
+            "price_change_count",   # price volatility signal
         ]
-        
-        # Create location_encoded using LabelEncoder (for saving)
-        le_location = LabelEncoder()
-        location_counts = df["location_grouped"].value_counts()
-        major_locations = location_counts[location_counts >= 20].index.tolist()
-        df["location_grouped"] = df["location"].apply(
-            lambda x: x if x in major_locations else "Other"
-        )
-        df["location_encoded"] = le_location.fit_transform(df["location_grouped"])
-        
-        # Make sure we have price_per_sqft
-        if "price_per_sqft" not in df.columns:
-            df["price_per_sqft"] = (df["price_cr"] * 10_000_000) / df["area_sqft"]
         
         X = df[FEATURE_COLS].values
         y = df["price_cr"].values
@@ -324,14 +313,14 @@ def run_model_retraining():
             pickle.dump(model_rf, f)
         logger.info(f"     ✓ Saved: {model_path}")
         
-        # Save as dict with le_location and le_ptype (needed for inference)
+        # Save encoder bundle with proper location/city means for inference
         encoder_dict = {
-            "le_location": le_location,
+            "le_location": encoder_bundle.get("le_location"),
             "le_ptype": encoder_bundle.get("le_ptype"),
             "location_means": encoder_bundle.get("location_means", {}),
             "city_means": encoder_bundle.get("city_means", {}),
             "global_mean_price": encoder_bundle.get("global_mean_price", float(df["price_cr"].mean())),
-            "major_locations": major_locations,
+            "major_locations": encoder_bundle.get("major_locations", []),
             "feature_cols": FEATURE_COLS,
         }
         
@@ -399,15 +388,15 @@ def load_models():
         with open(encoder_path, "rb") as f:
             enc = pickle.load(f)
         if isinstance(enc, tuple):
-            logger.warning("Old encoder tuple format - model was trained with 5 features")
+            logger.warning("Old encoder tuple format - converting to dict format")
             encoder_bundle_g = {
                 "le_location":       enc[0],
                 "le_ptype":          enc[1],
-                "location_means":    {},
-                "city_means":        {},
-                "global_mean_price": 10.0,
-                "major_locations":   [],
-                "feature_cols":      ["bhk", "area_sqft", "location_encoded", "ptype_encoded", "price_per_sqft"],
+                "location_means":    {},     # Will be computed from data
+                "city_means":        {},     # Will be computed from data
+                "major_locations":   [],     # Will be computed from data
+                "feature_cols":      ["bhk", "area_sqft", "location_target", "city_target",
+                                      "ptype_encoded", "days_on_market", "price_change_count"],
             }
         else:
             encoder_bundle_g = enc
@@ -623,27 +612,27 @@ def estimate_price(
         if not (300 <= area_sqft <= 10000):
             raise HTTPException(status_code=400, detail="Area must be 300-10,000 sqft")
         
-        # Resolve location/property type encodings
-        le_location_enc = encoder_bundle_g.get("le_location")
-        le_ptype_enc = encoder_bundle_g.get("le_ptype")
-        
-        # Handle location encoding
-        known_locs = set(le_location_enc.classes_) if le_location_enc else set()
-        loc_safe = location if location in known_locs else (le_location_enc.classes_[0] if le_location_enc else "Other")
-        location_encoded = int(le_location_enc.transform([loc_safe])[0]) if le_location_enc else 0
+        # Resolve location/property type from encoder bundles
+        location_means = encoder_bundle_g.get("location_means", {})
+        city_means     = encoder_bundle_g.get("city_means", {})
+        global_mean    = encoder_bundle_g.get("global_mean_price", 2.5)
+        major_locs     = encoder_bundle_g.get("major_locations", [])
         
         # Handle property type encoding
+        le_ptype_enc = encoder_bundle_g.get("le_ptype")
         try:
             ptype_encoded = int(le_ptype_enc.transform([property_type])[0]) if le_ptype_enc else 0
         except (ValueError, AttributeError):
             ptype_encoded = 0
             property_type = "Apartment"
         
-        # Calculate price_per_sqft
-        price_per_sqft = (1.5 * 10_000_000) / area_sqft if area_sqft > 0 else 0  # Placeholder for estimation
+        # Get target-encoded location and city values
+        loc_grouped = location if location in major_locs else "Other"
+        location_target = location_means.get(loc_grouped, global_mean)
+        city_target = city_means.get(city, city_means.get("Unknown", global_mean))
         
-        # Build features for the old 5-feature model: bhk, area_sqft, location_encoded, ptype_encoded, price_per_sqft
-        X = np.array([[bhk, area_sqft, location_encoded, ptype_encoded, price_per_sqft]])
+        # Build 7-feature array for new query (no listing history -> days_on_market=0, price_change_count=0)
+        X = np.array([[bhk, area_sqft, location_target, city_target, ptype_encoded, 0, 0]])
 
         # Prediction + 95% CI from individual tree spread
         all_tree_preds  = np.array([tree.predict(X)[0] for tree in model_rf.estimators_])
