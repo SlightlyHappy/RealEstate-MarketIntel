@@ -327,7 +327,16 @@ def run_model_retraining():
         with open(encoder_path, "wb") as f:
             pickle.dump(encoder_dict, f)
         logger.info(f"     ✓ Saved: {encoder_path}")
-        
+
+        # Save OOF predictions keyed by URL so they survive container restarts.
+        # load_models() will merge them back into market_data on startup.
+        oof_path = MODEL_DIR / "oof_predictions.pkl"
+        oof_df = df[["url", "oof_predicted_price"]].copy() if "url" in df.columns \
+            else pd.DataFrame({"_idx": df.index, "oof_predicted_price": df["oof_predicted_price"]})
+        with open(oof_path, "wb") as f:
+            pickle.dump(oof_df, f)
+        logger.info(f"     ✓ Saved OOF predictions: {oof_path}")
+
         # Update global state
         encoder_bundle_g = encoder_bundle
         market_data      = df
@@ -513,6 +522,23 @@ def load_models():
             market_data = mdf[~mdf["is_stale"].fillna(False)].copy()
         else:
             market_data = mdf.copy()
+
+        # Restore OOF predictions saved by the last retrain (keyed by URL).
+        # This makes the deal finder use honest cross-validated estimates even
+        # after a container restart/redeploy.
+        oof_path = MODEL_DIR / "oof_predictions.pkl"
+        if oof_path.exists():
+            try:
+                oof_df = pickle.load(open(oof_path, "rb"))
+                if "url" in oof_df.columns and "url" in market_data.columns:
+                    market_data = market_data.merge(
+                        oof_df[["url", "oof_predicted_price"]],
+                        on="url", how="left"
+                    )
+                    restored = market_data["oof_predicted_price"].notna().sum()
+                    logger.info(f"Restored {restored}/{len(market_data)} OOF predictions from disk")
+            except Exception as oof_err:
+                logger.warning(f"Could not restore OOF predictions: {oof_err}")
 
         last_update_time = datetime.fromtimestamp(data_path.stat().st_mtime)
         logger.info(f"Models loaded: {len(market_data)} active properties")
